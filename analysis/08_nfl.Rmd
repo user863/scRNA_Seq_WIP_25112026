@@ -1,0 +1,381 @@
+---
+title: "xALD single-cell atlas -- Part 8: Serum NfL correlates [EXPLORATORY]"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/08_nfl.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 11, fig.height = 8, dpi = 110)
+```
+
+# Part 8: Serum NfL correlates [EXPLORATORY]
+
+## 8.1 Settings
+
+```{r nfl-settings}
+NFL <- list(
+  tissues        = c("CSF", "PBMC"),
+  min_donors     = 5,
+  q_supported    = 0.10,
+  p_exploratory  = 0.05,
+  top_n          = 6,
+  resume         = TRUE,
+  seed           = 1)
+NFL_SCORE_SETS <- lapply(list(
+  hypothesis = c("SREBP2_TARGETS_CORE", "LXR_TARGETS", "OXYSTEROL_METABOLISM",
+                 "HALLMARK_INTERFERON_GAMMA_RESPONSE", "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+                 "MHCII_ANTIGEN_PRESENTATION", "NLRP3_INFLAMMASOME", "VLCFA_PEROXISOME",
+                 "LAM_CORE", "PHAGOCYTOSIS_EFFEROCYTOSIS"),
+  confound   = c("GC_RESPONSE_CANONICAL", "GC_RESPONSE_MYELOID"),
+  control    = c("HALLMARK_OXIDATIVE_PHOSPHORYLATION", "IEG_DISSOCIATION_STRESS")), gs_current_names)
+NFL_SOURCES <- list(
+  myeloid = list(file = "05_myeloidCells_filtered_xALD.qs", label = "celltype_mc", level_all = "all_myeloid"),
+  tcells  = list(file = "07_t_cells_filtered_xALD.qs",      label = "celltype",    level_all = "all_T"),
+  B       = list(file = "08R_bnk_cells_annotated_xALD.qs",   label = "celltype",    level_all = "all_B",  bnk = "B"),
+  NK      = list(file = "08R_bnk_cells_annotated_xALD.qs",   label = "celltype",    level_all = "all_NK", bnk = "NK"))
+deg_contrast_labels$nfl              <- "serum NfL (log10)"
+deg_contrast_labels$nfl_within_stage <- "serum NfL (log10), adjusted for stage"
+dir.create(path$tables_nfl, recursive = TRUE, showWarnings = FALSE)
+dir.create(path$graphs_nfl, recursive = TRUE, showWarnings = FALSE)
+set.seed(NFL$seed)
+```
+
+## 8.2 Donors and objects
+
+```{r nfl-data}
+yn <- function(x) ifelse(is.na(x), NA, tolower(as.character(x)) %in% c("yes", "y", "true", "1"))
+nfl_ids <- CLIN_SEVERITY$patient_ID[is.finite(CLIN_SEVERITY$serum_nfl)]
+
+nfl_read <- function(src) {
+  x <- qs::qread(file.path(path$objects, src$file))
+  objs <- if (is.null(src$bnk)) x[intersect(NFL$tissues, names(x))] else
+    stats::setNames(x[paste0(src$bnk, "_", NFL$tissues)], NFL$tissues)
+  objs <- Filter(Negate(is.null), lapply(objs, function(so) {
+    if (is.null(so)) return(NULL)
+    if (inherits(so[["RNA"]], "Assay5")) so[["RNA"]] <- JoinLayers(so[["RNA"]])
+    so <- add_severity(so, quiet = TRUE)
+    keep <- as.character(so$patient_ID) %in% nfl_ids
+    if (!any(keep)) NULL else so[, keep]
+  }))
+  objs
+}
+nfl_objs <- lapply(NFL_SOURCES, nfl_read)
+
+nfl_donors <- dplyr::bind_rows(lapply(unlist(nfl_objs, recursive = FALSE), function(so) {
+  md <- so@meta.data
+  data.frame(donor = as.character(md$patient_ID),
+             hc  = if ("Hydrocortisone" %in% names(md)) as.character(md$Hydrocortisone) else NA,
+             age = if ("age" %in% names(md)) as.character(md$age) else NA)
+})) %>% dplyr::distinct() %>%
+  dplyr::group_by(donor) %>% dplyr::summarise(hc = dplyr::first(stats::na.omit(hc)),
+                                              age = dplyr::first(stats::na.omit(age)), .groups = "drop") %>%
+  dplyr::right_join(dplyr::filter(CLIN_SEVERITY, patient_ID %in% nfl_ids) %>%
+                      dplyr::select(donor = patient_ID, severity, serum_nfl), by = "donor") %>%
+  dplyr::mutate(hc = yn(hc), age = suppressWarnings(as.numeric(gsub(",", ".", age))),
+                nfl_log10 = log10(serum_nfl),
+                stage = factor(paste0("sev", severity), levels = paste0("sev", 0:3))) %>%
+  dplyr::arrange(serum_nfl)
+kable_save(nfl_donors, "nfl_donors", dir = path$tables_nfl, digits = 3,
+           caption = "Donors with serum NfL: stage, hydrocortisone, age")
+print(knitr::kable(nfl_donors, digits = 2))
+
+rng <- nfl_donors %>% dplyr::group_by(stage) %>%
+  dplyr::summarise(lo = min(serum_nfl), hi = max(serum_nfl), n = dplyr::n(), .groups = "drop")
+print(rng)
+nfl_separates <- nrow(rng) == 2 && (rng$hi[1] < rng$lo[2] || rng$hi[2] < rng$lo[1])
+message("NfL ", if (isTRUE(nfl_separates)) "SEPARATES the stages completely" else "overlaps between stages",
+        "; Spearman NfL ~ age: ",
+        round(suppressWarnings(stats::cor(nfl_donors$nfl_log10, nfl_donors$age, method = "spearman",
+                                          use = "complete.obs")), 2))
+```
+
+## 8.3 Functions
+
+```{r nfl-functions}
+nfl_runner <- function(so, donor_col = "patient_ID", min_cells = DEG_MIN_CELLS_PER_SAMPLE) {
+  out <- list(nfl = NULL, nfl_within_stage = NULL)
+  pb <- tryCatch(make_pseudobulk(so, donor_col, min_cells = min_cells), error = function(e) conditionMessage(e))
+  if (is.character(pb)) return(lapply(out, function(x) pb))
+  sm <- pb$meta
+  i  <- match(sm[[donor_col]], nfl_donors$donor)
+  sm$nfl_log10 <- nfl_donors$nfl_log10[i]
+  sm$stage     <- droplevels(nfl_donors$stage[i])
+  sm <- sm[is.finite(sm$nfl_log10), , drop = FALSE]
+  if (nrow(sm) < NFL$min_donors)
+    return(lapply(out, function(x) sprintf("fewer than %d donors with NfL (n=%d)", NFL$min_donors, nrow(sm))))
+  sm$nfl_c <- sm$nfl_log10 - mean(sm$nfl_log10)
+  cnt <- pb$counts[, rownames(sm), drop = FALSE]
+  out$nfl <- tryCatch(get_res(fit_dds(cnt, sm, ~ nfl_c), list("nfl_c")),
+                      error = function(e) trimws(conditionMessage(e)))
+  n_st <- table(sm$stage)
+  out$nfl_within_stage <- if (length(n_st) < 2 || any(n_st < 2)) "needs >= 2 donors in each of 2 stages" else
+    tryCatch(get_res(fit_dds(cnt, sm, ~ stage + nfl_c), list("nfl_c")),
+             error = function(e) trimws(conditionMessage(e)))
+  out
+}
+
+NFL_PERM <- new.env()
+nfl_perms <- function(n) {
+  k <- as.character(n)
+  if (!is.null(NFL_PERM[[k]])) return(NFL_PERM[[k]])
+  p <- if (n == 1) matrix(1L, 1, 1) else {
+    q <- nfl_perms(n - 1)
+    do.call(rbind, lapply(seq_len(n), function(i) cbind(i, q + (q >= i))))
+  }
+  storage.mode(p) <- "integer"; NFL_PERM[[k]] <- p; p
+}
+nfl_perms_within <- function(strata) {
+  idx <- split(seq_along(strata), as.character(strata))
+  per <- lapply(idx, function(ix) { p <- nfl_perms(length(ix)); matrix(ix[p], nrow = nrow(p)) })
+  grid <- expand.grid(lapply(per, function(p) seq_len(nrow(p))))
+  out <- matrix(0L, nrow(grid), length(strata))
+  for (s in seq_along(per)) out[, idx[[s]]] <- per[[s]][grid[[s]], , drop = FALSE]
+  out
+}
+nfl_spearman <- function(Y, x, P) {
+  ry <- t(apply(Y, 1, rank)); rx <- rank(x)
+  X  <- matrix(rx[P], nrow = nrow(P))
+  null <- suppressWarnings(stats::cor(t(X), t(ry)))
+  obs  <- suppressWarnings(drop(stats::cor(rx, t(ry))))
+  p <- vapply(seq_along(obs), function(k) if (!is.finite(obs[k])) NA_real_ else
+    mean(abs(null[, k]) >= abs(obs[k]) - 1e-10, na.rm = TRUE), numeric(1))
+  list(rho = obs, p = p, n_perm = nrow(P))
+}
+nfl_tier <- function(q, p) dplyr::case_when(
+  is.finite(q) & q < NFL$q_supported   ~ "supported",
+  is.finite(p) & p < NFL$p_exploratory ~ "exploratory",
+  TRUE                                 ~ "no evidence at this sample size")
+nfl_short <- function(x) sub("^BIO-", "", x)
+```
+
+## 8.4 DEG along serum NfL
+
+```{r nfl-deg}
+nfl_units <- unlist(lapply(names(NFL_SOURCES), function(cp) {
+  src <- NFL_SOURCES[[cp]]; objs <- nfl_objs[[cp]]
+  if (!length(objs)) return(list())
+  u <- deg_loo_units(objs, NFL$tissues, src$level_all, src$label)
+  if (!is.null(src$bnk)) u <- lapply(u, function(x) { if (x$level == "celltype") x$level <- paste0("celltype_", src$bnk); x })
+  lapply(u, function(x) c(x, compartment = cp))
+}), recursive = FALSE)
+message(length(nfl_units), " DEG families")
+
+nfl_deg_ckpt <- file.path(path$objects, "nfl", "nfl_deg.qs")
+dir.create(dirname(nfl_deg_ckpt), recursive = TRUE, showWarnings = FALSE)
+if (isTRUE(NFL$resume) && file.exists(nfl_deg_ckpt)) {
+  deg_nfl <- qs::qread(nfl_deg_ckpt)
+} else {
+  deg_nfl <- dplyr::bind_rows(lapply(nfl_units, function(u) {
+    message("NfL DEG | ", u$tissue, " | ", u$level, " | ", u$subset)
+    flatten_contrasts(nfl_runner(u$get()), u$tissue, u$level, u$subset)
+  }))
+  qs::qsave(deg_nfl, nfl_deg_ckpt)
+}
+deg_nfl <- collect_deg_results(deg_nfl, csv_prefix = file.path(path$tables_nfl, "DEG_nfl"))
+deg_nfl %>% dplyr::filter(status == "ok") %>%
+  dplyr::group_by(tissue, level, subset, comparison) %>%
+  dplyr::summarise(genes = dplyr::n(),
+                   significant = sum(deg_is_sig(padj, log2FC) & !gene_class %in% DEG_MASK_CLASSES), .groups = "drop") %>%
+  dplyr::arrange(comparison, dplyr::desc(significant)) %>%
+  knitr::kable(caption = "Significant genes per family (padj < 0.05)")
+```
+
+## 8.5 Gene sets along serum NfL
+
+```{r nfl-genesets}
+gs_nfl <- gs_assemble(unique(deg_nfl$gene[deg_nfl$status == "ok"]))
+gs_res_nfl_all <- gs_run(deg_nfl, gs_nfl$sets, c("nfl", "nfl_within_stage"), levels_use = unique(deg_nfl$level))
+readr::write_csv(gs_res_nfl_all, file.path(path$tables_nfl, "geneset_nfl_all_rankings.csv"))
+gs_res_nfl <- gs_finalise(gs_res_nfl_all, gs_nfl$provenance)
+readr::write_csv(gs_res_nfl, file.path(path$tables_nfl, "geneset_nfl.csv"))
+```
+
+## 8.6 Leave-one-donor-out (genes and sets)
+
+```{r nfl-loo}
+loo_nfl <- deg_loo_run(nfl_units, deg_nfl, "nfl", sets = gs_nfl$sets, gs_full = gs_res_nfl, runner = nfl_runner)
+readr::write_csv(loo_nfl$genes, file.path(path$tables_nfl, "DEG_nfl_loo_genes.csv"))
+kable_save(deg_loo_summary(loo_nfl$genes), "DEG_nfl_loo_summary", dir = path$tables_nfl, digits = 3,
+           caption = "NfL DEG: share of significant genes retained when one donor is removed")
+kable_save(deg_loo_summary(loo_nfl$sets), "geneset_nfl_loo_summary", dir = path$tables_nfl, digits = 3,
+           caption = "NfL gene sets: share of significant sets retained when one donor is removed")
+deg_nfl <- collect_deg_results(loo_annotate(deg_nfl, loo_nfl$genes, "gene"),
+                               csv_prefix = file.path(path$tables_nfl, "DEG_nfl"))
+gs_res_nfl <- loo_annotate(gs_res_nfl, loo_nfl$sets, "set")
+readr::write_csv(gs_res_nfl, file.path(path$tables_nfl, "geneset_nfl.csv"))
+gs_res_nfl %>% dplyr::filter(agree, panel != "control") %>%
+  dplyr::arrange(comparison, tissue, level, subset, padj_fgsea) %>%
+  dplyr::select(comparison, tissue, level, subset, set, NES, padj_fgsea, padj_camera,
+                global_shift_flag, ieg_flag, loo_frac_retained, loo_lost_without, leading_edge) %>%
+  kable_save("geneset_nfl_significant", dir = path$tables_nfl, digits = 3,
+             caption = "Gene sets along serum NfL (fgsea and cameraPR agree), with leave-one-donor-out")
+```
+
+## 8.7 Donor set scores: exact rank tests
+
+```{r nfl-scores}
+nfl_role <- stats::setNames(rep(names(NFL_SCORE_SETS), lengths(NFL_SCORE_SETS)), unlist(NFL_SCORE_SETS))
+score_sets <- gs_nfl$sets[intersect(names(nfl_role), names(gs_nfl$sets))]
+nfl_scores <- dplyr::bind_rows(lapply(names(NFL_SOURCES), function(cp) {
+  objs <- nfl_objs[[cp]]; if (!length(objs)) return(NULL)
+  gs_donor_scores(objs, score_sets, NFL_SOURCES[[cp]]$label, min_donors = NFL$min_donors) %>%
+    dplyr::mutate(compartment = cp, .before = 1)
+}))
+readr::write_csv(nfl_scores, file.path(path$tables_nfl, "nfl_donor_scores.csv"))
+
+nfl_score_tests <- nfl_scores %>%
+  dplyr::group_by(compartment, tissue, celltype) %>%
+  dplyr::group_modify(function(d, key) {
+    Y <- tidyr::pivot_wider(d, id_cols = set, names_from = donor, values_from = score)
+    sets <- Y$set; Y <- as.matrix(Y[, -1, drop = FALSE]); rownames(Y) <- sets
+    Y <- Y[, colSums(is.na(Y)) == 0, drop = FALSE]
+    dn <- colnames(Y); dd <- nfl_donors[match(dn, nfl_donors$donor), ]
+    if (length(dn) < NFL$min_donors) return(tibble::tibble())
+    x  <- dd$nfl_log10
+    ex <- nfl_spearman(Y, x, nfl_perms(length(x)))
+    ws <- if (length(unique(dd$stage)) > 1) nfl_spearman(Y, x, nfl_perms_within(dd$stage)) else NULL
+    loo <- vapply(seq_along(x), function(j)
+      as.numeric(suppressWarnings(stats::cor(rank(x[-j]), apply(Y[, -j, drop = FALSE], 1, rank)))),
+      numeric(nrow(Y)))
+    loo <- matrix(loo, nrow = nrow(Y))
+    tibble::tibble(set = sets, role = unname(nfl_role[sets]), n_donors = length(dn),
+                   rho = ex$rho, p_exact = ex$p, n_perm = ex$n_perm,
+                   p_within_stage = if (is.null(ws)) NA_real_ else ws$p,
+                   n_perm_within = if (is.null(ws)) NA_integer_ else ws$n_perm,
+                   loo_rho_min = apply(loo, 1, min, na.rm = TRUE), loo_rho_max = apply(loo, 1, max, na.rm = TRUE),
+                   loo_sign_flip = sign(loo_rho_min) != sign(rho) | sign(loo_rho_max) != sign(rho))
+  }) %>% dplyr::ungroup() %>%
+  dplyr::group_by(compartment, tissue, celltype, role) %>%
+  dplyr::mutate(q = stats::p.adjust(p_exact, "BH")) %>% dplyr::ungroup() %>%
+  dplyr::mutate(tier = nfl_tier(q, p_exact)) %>%
+  dplyr::arrange(role != "hypothesis", p_exact)
+kable_save(nfl_score_tests, "nfl_score_tests", dir = path$tables_nfl, digits = 4,
+           caption = "Donor set scores vs log10 serum NfL: Spearman, exact and within-stage permutation p")
+print(knitr::kable(utils::head(dplyr::filter(nfl_score_tests, role == "hypothesis"), 15), digits = 3))
+```
+
+## 8.8 Concordance with the severity contrasts
+
+```{r nfl-concordance}
+sev_tabs <- c(myeloid = "DEG_myeloid_all_genes.csv", tcells = "DEG_tcells_all_genes.csv")
+nfl_conc <- dplyr::bind_rows(lapply(names(sev_tabs), function(cp) {
+  f <- file.path(path$tables, sev_tabs[[cp]])
+  if (!file.exists(f)) { message("not found (run Part ", if (cp == "myeloid") 3 else 4, "): ", f); return(NULL) }
+  sev <- readr::read_csv(f, show_col_types = FALSE) %>%
+    dplyr::filter(status == "ok", comparison %in% c("sev3_vs_sev12", "sev3_vs_sev2")) %>%
+    dplyr::select(tissue, level, subset, comparison, gene, lfc_sev = log2FC_MLE, padj_sev = padj)
+  nf <- deg_nfl %>% dplyr::filter(status == "ok", comparison == "nfl") %>%
+    dplyr::select(tissue, level, subset, gene, lfc_nfl = log2FC_MLE, padj_nfl = padj)
+  dplyr::inner_join(nf, sev, by = c("tissue", "level", "subset", "gene")) %>%
+    dplyr::group_by(tissue, level, subset, comparison) %>%
+    dplyr::summarise(genes = dplyr::n(),
+                     rho_lfc = suppressWarnings(stats::cor(lfc_nfl, lfc_sev, method = "spearman", use = "complete.obs")),
+                     sig_nfl = sum(padj_nfl < 0.05, na.rm = TRUE), sig_sev = sum(padj_sev < 0.05, na.rm = TRUE),
+                     sig_both_same_dir = sum(padj_nfl < 0.05 & padj_sev < 0.05 & sign(lfc_nfl) == sign(lfc_sev), na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(compartment = cp, .before = 1)
+}))
+if (nrow(nfl_conc)) kable_save(nfl_conc, "nfl_concordance_severity", dir = path$tables_nfl, digits = 3,
+                               caption = "NfL slope vs severity contrast (log2FC, across genes), per family")
+```
+
+## 8.9 Figures
+
+```{r nfl-figures, fig.width = 7.2, fig.height = 6}
+nfl_save <- function(fig, stem, h, w = FIG_WIDTH_MM[["double"]])
+  save_umap_fig(fig, stem, path$graphs_nfl, width_mm = w, height_mm = min(h, FIG_MAX_DEPTH_MM))
+nfl_hc_shapes <- c(`FALSE` = 21, `TRUE` = 24)
+nfl_hc_lab    <- c(`FALSE` = "no hydrocortisone", `TRUE` = "hydrocortisone")
+
+f <- ggplot2::ggplot(nfl_donors, ggplot2::aes(stage, serum_nfl)) +
+  ggplot2::geom_point(ggplot2::aes(fill = stage, shape = hc), size = 2.2, stroke = 0.3) +
+  ggrepel::geom_text_repel(ggplot2::aes(label = nfl_short(donor)), size = FIG_MIN_PT / ggplot2::.pt,
+                           colour = "grey30", seed = 1) +
+  ggplot2::scale_y_log10() +
+  ggplot2::scale_fill_manual(values = SEVERITY_COLS, guide = "none") +
+  ggplot2::scale_shape_manual(values = nfl_hc_shapes, labels = nfl_hc_lab, name = NULL, na.value = 22) +
+  ggplot2::scale_x_discrete(labels = c(sev2 = "smoldering CALD (2)", sev3 = "active CALD (3)")) +
+  ggplot2::labs(x = NULL, y = "serum NfL (pg/mL, log scale)",
+                title = sprintf("Serum NfL in %d X-ALD donors%s", nrow(nfl_donors),
+                                if (isTRUE(nfl_separates)) " -- separates the stages completely" else "")) +
+  gs_theme() + ggplot2::theme(plot.title = ggplot2::element_text(size = FIG_BASE_PT, face = "bold"))
+print(f); nfl_save(f, "nfl_by_stage", 60, FIG_WIDTH_MM[["single"]])
+
+hd <- deg_nfl %>% dplyr::filter(status == "ok", !gene_class %in% DEG_MASK_CLASSES)
+fams <- hd %>% dplyr::group_by(tissue, level, subset, comparison) %>%
+  dplyr::summarise(n = sum(deg_is_sig(padj, log2FC)), .groups = "drop") %>% dplyr::filter(n > 0)
+for (i in seq_len(nrow(fams))) {
+  fm <- fams[i, ]
+  df <- dplyr::semi_join(hd, fm, by = c("tissue", "level", "subset", "comparison"))
+  p <- plot_volcano(df, title = paste(fm$tissue, "-", fm$subset, if (fm$level != "celltype") paste0("(", fm$level, ")"),
+                                      "-", deg_contrast_labels[[fm$comparison]]),
+                    lfc_col = "log2FC_MLE", padj_col = "padj", gene_col = "gene",
+                    subtitle = "x: log2FC per tenfold serum NfL (MLE); exploratory, n ~ 7 donors")
+  print(p)
+  ggplot2::ggsave(file.path(path$graphs_nfl, paste0("volcano_nfl_", sanitize(paste(fm$tissue, fm$level, fm$subset, fm$comparison)), ".png")),
+                  p, width = 7, height = 6, dpi = 300)
+}
+
+for (cp in names(NFL_SOURCES)) {
+  lv <- unique(c(NFL_SOURCES[[cp]]$level_all, if (is.null(NFL_SOURCES[[cp]]$bnk)) "celltype" else paste0("celltype_", NFL_SOURCES[[cp]]$bnk)))
+  units_cp <- vapply(Filter(function(u) u$compartment == cp, nfl_units), function(u) u$subset, "")
+  d <- gs_res_nfl %>% dplyr::filter(comparison == "nfl", level %in% lv, subset %in% c("all", units_cp))
+  if (!nrow(d)) next
+  p <- gs_plot_dots(d, gs_nfl$provenance, title = paste0("Gene sets along serum NfL, ", cp,
+                                                         " (NES; ring = significant, column agree)"))
+  print(p)
+  nfl_save(p, paste0("geneset_nfl_", cp), round(3.2 * length(unique(d$set)) + 45))
+}
+
+pk <- nfl_score_tests %>% dplyr::filter(role == "hypothesis", tier == "supported")
+sup <- nrow(pk) > 0
+if (!sup) pk <- nfl_score_tests %>% dplyr::filter(role == "hypothesis", tier == "exploratory") %>% utils::head(3)
+pk <- utils::head(pk, NFL$top_n)
+if (nrow(pk)) {
+  ps <- lapply(seq_len(nrow(pk)), function(i) {
+    h <- pk[i, ]
+    d <- nfl_scores %>% dplyr::filter(compartment == h$compartment, tissue == h$tissue, celltype == h$celltype, set == h$set) %>%
+      dplyr::left_join(nfl_donors, by = "donor")
+    ggplot2::ggplot(d, ggplot2::aes(serum_nfl, score)) +
+      ggplot2::geom_smooth(method = "lm", formula = y ~ x, se = FALSE, colour = "grey50", linewidth = 0.4, linetype = 2) +
+      ggplot2::geom_point(ggplot2::aes(fill = stage, shape = hc), size = 2, stroke = 0.3) +
+      ggrepel::geom_text_repel(ggplot2::aes(label = nfl_short(donor)), size = FIG_MIN_PT / ggplot2::.pt,
+                               colour = "grey30", seed = 1) +
+      ggplot2::scale_x_log10() +
+      ggplot2::scale_fill_manual(values = SEVERITY_COLS, labels = c(sev2 = "stage 2", sev3 = "stage 3"), name = NULL) +
+      ggplot2::scale_shape_manual(values = nfl_hc_shapes, labels = nfl_hc_lab, name = NULL, na.value = 22) +
+      ggplot2::guides(fill = ggplot2::guide_legend(override.aes = list(shape = 21))) +
+      ggplot2::labs(x = "serum NfL (pg/mL, log)", y = "set score (mean z)",
+                    title = paste0(sub("^(HALLMARK|REACTOME)_", "", h$set), " | ", h$celltype, " (", h$tissue, ")"),
+                    subtitle = sprintf("%s; rho %.2f, p %.3g, q %.3g; within stage p %.2g",
+                                       h$tier, h$rho, h$p_exact, h$q, h$p_within_stage)) +
+      gs_theme() + ggplot2::theme(plot.title = ggplot2::element_text(size = FIG_BASE_PT, face = "bold"),
+                                  plot.subtitle = ggplot2::element_text(size = FIG_MIN_PT))
+  })
+  f <- patchwork::wrap_plots(ps, ncol = 3, guides = "collect") +
+    patchwork::plot_annotation(
+      title = if (sup) "Donor set scores along serum NfL" else "Donor set scores along serum NfL (no supported result: exploratory shown)",
+      caption = "Spearman, exact permutation over all donor orderings; within-stage p = NfL shuffled within stage only. Exploratory.",
+      theme = ggplot2::theme(plot.title = ggplot2::element_text(size = FIG_BASE_PT, face = "bold"),
+                             plot.caption = ggplot2::element_text(size = FIG_MIN_PT, hjust = 0))) &
+    ggplot2::theme(legend.position = "bottom")
+  print(f); nfl_save(f, "nfl_score_scatter", 25 + 55 * ceiling(nrow(pk) / 3))
+}
+```
+
+# Session info
+
+```{r session-info-08-nfl}
+sessionInfo()
+```

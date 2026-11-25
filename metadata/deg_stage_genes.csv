@@ -1,0 +1,170 @@
+compartment,contrast,tissue,level,subset,gene
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,TLN2
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,FCGR1B
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,CCL2
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,DDT
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,BLVRA
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,PADI2
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,ATP6V1G1
+myeloid,xALD_vs_ctrl,CSF,all_myeloid,all,NR1D2
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,ANXA2
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,VIM
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,AIF1
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,S100A6
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,LYZ
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,TLN2
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,PDE3B
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,CEBPD
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,A2M
+myeloid,xALD_vs_ctrl,CSF,celltype,Lipid-associated Macrophages,PYCARD
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,DDT
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,LGALS1
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,HLA-DRA
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,ANXA2
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,TKT
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,CIB1
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,LGALS3
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,FTL
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,TYROBP
+myeloid,xALD_vs_ctrl,CSF,celltype,tissue associated macrophages,CD9
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,NUCB1
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,FCGR1A
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,FERMT3
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,S100A6
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,PER2
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,ARNTL
+myeloid,xALD_vs_ctrl,PBMC,all_myeloid,all,DBP
+myeloid,xALD_vs_ctrl,PBMC,celltype,CD14-Monocytes,FCGR1A
+myeloid,xALD_vs_ctrl,PBMC,celltype,CD14-Monocytes,LST1
+myeloid,xALD_vs_ctrl,PBMC,celltype,CD14-Monocytes,FERMT3
+myeloid,xALD_vs_ctrl,PBMC,celltype,CD14-Monocytes,NUCB1
+tcells,xALD_vs_ctrl,CSF,all_T,all,IFNGR1
+tcells,xALD_vs_ctrl,CSF,all_T,all,GZMK
+tcells,xALD_vs_ctrl,CSF,all_T,all,GZMA
+tcells,xALD_vs_ctrl,CSF,all_T,all,CCL4
+tcells,xALD_vs_ctrl,CSF,all_T,all,GZMM
+tcells,xALD_vs_ctrl,CSF,all_T,all,HOPX
+tcells,xALD_vs_ctrl,CSF,all_T,all,APOBEC3G
+tcells,xALD_vs_ctrl,CSF,all_T,all,HCST
+tcells,xALD_vs_ctrl,CSF,all_T,all,CKLF
+tcells,xALD_vs_ctrl,CSF,all_T,all,CD99
+tcells,xALD_vs_ctrl,CSF,lineage,CD4,GZMK
+tcells,xALD_vs_ctrl,CSF,lineage,CD4,IFNGR1
+tcells,xALD_vs_ctrl,CSF,lineage,CD4,GZMA
+tcells,xALD_vs_ctrl,CSF,lineage,CD4,RGS1
+tcells,xALD_vs_ctrl,CSF,lineage,CD8,ITGA1
+tcells,xALD_vs_ctrl,CSF,lineage,CD8,HOPX
+tcells,xALD_vs_ctrl,CSF,lineage,CD8,ISCU
+tcells,xALD_vs_ctrl,CSF,lineage,CD8,RASA3
+tcells,xALD_vs_ctrl,CSF,celltype,CD8 TEM (GZMK+),ISCU
+tcells,xALD_vs_ctrl,CSF,celltype,gdT,GZMK
+tcells,xALD_vs_ctrl,PBMC,all_T,all,LCLAT1
+tcells,xALD_vs_ctrl,PBMC,all_T,all,OSBPL1A
+tcells,xALD_vs_ctrl,PBMC,all_T,all,TMEM45B
+tcells,xALD_vs_ctrl,PBMC,all_T,all,LY6E
+tcells,xALD_vs_ctrl,PBMC,all_T,all,CDC42SE1
+tcells,xALD_vs_ctrl,PBMC,all_T,all,MORF4L1
+tcells,xALD_vs_ctrl,PBMC,all_T,all,PABPN1
+tcells,xALD_vs_ctrl,PBMC,all_T,all,TTC32
+tcells,xALD_vs_ctrl,PBMC,all_T,all,MINK1
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,LCLAT1
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,OSBPL1A
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,TMEM45B
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,MINK1
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,LY6E
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,MT1X
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,BCL2A1
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,TECR
+tcells,xALD_vs_ctrl,PBMC,lineage,CD4,LEPR
+tcells,xALD_vs_ctrl,PBMC,celltype,CD4 TCM,LCLAT1
+tcells,xALD_vs_ctrl,PBMC,celltype,CD4 TCM,MT1X
+tcells,xALD_vs_ctrl,PBMC,celltype,CD8 Naive/TCM,LCLAT1
+tcells,xALD_vs_ctrl,PBMC,celltype,gdT,GZMK
+tcells,xALD_vs_ctrl,PBMC,celltype,gdT,S100A4
+tcells,xALD_vs_ctrl,PBMC,celltype,gdT,CTSC
+tcells,xALD_vs_ctrl,PBMC,celltype,gdT,HCST
+tcells,xALD_vs_ctrl,PBMC,celltype,gdT,KLF2
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,APOC2
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,SPP1
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,IL1B
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,SOD2
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,FTL
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,GPAT3
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,FABP5
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,CST3
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,CX3CR1
+myeloid,sev_trend_xald,CSF,celltype,Lipid-associated Macrophages,IFI30
+myeloid,sev_trend_xald,CSF,celltype,BAM,CD36
+myeloid,sev_trend_xald,CSF,celltype,Monocytes,LYVE1
+myeloid,sev_trend_xald,CSF,all_myeloid,all,LGALS2
+myeloid,sev_trend_xald,CSF,all_myeloid,all,ANPEP
+myeloid,sev_trend_xald,CSF,all_myeloid,all,ARRDC3
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,PDE4B
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,PDE3B
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,MSR1
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,INSIG1
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,S100A8
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,NFKBIZ
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,MS4A7
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,SETBP1
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,F13A1
+myeloid,sev_trend_xald,PBMC,all_myeloid,all,PKM
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,S100A8
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,S100A9
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,CD14
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,C5AR1
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,KYNU
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,LGALS3
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,YBX3
+myeloid,sev_trend_xald,PBMC,celltype,CD16+ Monocytes,TBC1D8
+myeloid,sev_trend_xald,PBMC,celltype,CD14-Monocytes,PDE3B
+myeloid,sev_trend_xald,PBMC,celltype,CD14-Monocytes,NHSL1
+myeloid,sev_trend_xald,PBMC,celltype,CD14-Monocytes,ZFP36L1
+myeloid,sev_trend_xald,PBMC,celltype,CD14-Monocytes,GNA13
+myeloid,sev_trend_xald,PBMC,celltype,IFN-Monocytes,PDE4B
+myeloid,sev_trend_xald,PBMC,celltype,IFN-Monocytes,IRS2
+myeloid,sev_trend_xald,PBMC,celltype,IFN-Monocytes,SIPA1L1
+myeloid,sev_trend_xald,PBMC,celltype,IFN-Monocytes,SPATA13
+myeloid,sev_trend_xald,PBMC,celltype,IFN-Monocytes,CDV3
+tcells,sev_trend_xald,CSF,all_T,all,SRSF5
+tcells,sev_trend_xald,CSF,lineage,CD4,SRSF5
+tcells,sev_trend_xald,CSF,lineage,CD4,IFNG-AS1
+tcells,sev_trend_xald,CSF,lineage,CD4,MYC
+tcells,sev_trend_xald,CSF,lineage,CD4,SLAMF6
+tcells,sev_trend_xald,CSF,lineage,CD4,ALOX5AP
+tcells,sev_trend_xald,CSF,lineage,CD4,NPM1
+tcells,sev_trend_xald,CSF,celltype,CD4 TCM,SRSF5
+tcells,sev_trend_xald,CSF,celltype,CD4 TCM,AOAH
+tcells,sev_trend_xald,PBMC,all_T,all,KLF2
+tcells,sev_trend_xald,PBMC,all_T,all,LDHA
+tcells,sev_trend_xald,PBMC,all_T,all,MIF
+tcells,sev_trend_xald,PBMC,all_T,all,GPX4
+tcells,sev_trend_xald,PBMC,all_T,all,IRF3
+tcells,sev_trend_xald,PBMC,all_T,all,IL27RA
+tcells,sev_trend_xald,PBMC,all_T,all,NCOA2
+tcells,sev_trend_xald,PBMC,all_T,all,CXCR4
+tcells,sev_trend_xald,PBMC,all_T,all,PTPN6
+tcells,sev_trend_xald,PBMC,all_T,all,PRKCB
+tcells,sev_trend_xald,PBMC,lineage,CD4,PDE3B
+tcells,sev_trend_xald,PBMC,lineage,CD4,LBR
+tcells,sev_trend_xald,PBMC,lineage,CD4,XBP1
+tcells,sev_trend_xald,PBMC,lineage,CD4,PYCARD
+tcells,sev_trend_xald,PBMC,lineage,CD4,IRAK4
+tcells,sev_trend_xald,PBMC,lineage,CD4,SRM
+tcells,sev_trend_xald,PBMC,lineage,CD4,CD3G
+tcells,sev_trend_xald,PBMC,lineage,CD4,KLF2
+tcells,sev_trend_xald,PBMC,celltype,CD4 Naive/TCM early,PDE3B
+tcells,sev_trend_xald,PBMC,celltype,CD4 Naive/TCM early,SSBP2
+tcells,sev_trend_xald,PBMC,celltype,CD4 Naive/TCM early,LBR
+tcells,sev_trend_xald,PBMC,celltype,CD4 Naive/TCM early,NR3C2
+tcells,sev_trend_xald,PBMC,celltype,CD4 Naive/TCM early,CD226
+tcells,sev_trend_xald,PBMC,celltype,CD4 Naive/TCM early,KLF2
+tcells,sev_trend_xald,PBMC,celltype,CD8 Naive/TCM,CSGALNACT1
+tcells,sev_trend_xald,PBMC,celltype,CD8 Naive/TCM,PDE3B
+tcells,sev_trend_xald,PBMC,celltype,CD8 Naive/TCM,NR3C2
+tcells,sev_trend_xald,PBMC,celltype,CD8 Naive/TCM,CCND3
+tcells,sev_trend_xald,PBMC,celltype,CD8 Naive/TCM,KLF2
+tcells,sev_trend_xald,PBMC,celltype,CD8 TEM (GZMB+),IL7R
+tcells,sev_trend_xald,PBMC,celltype,CD8 TEM (GZMB+),CBLB
+tcells,sev_trend_xald,PBMC,celltype,CD8 TEM (GZMB+),A2M
+tcells,sev_trend_xald,PBMC,celltype,CD8 TEM (GZMB+),ZEB1

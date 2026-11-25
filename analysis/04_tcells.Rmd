@@ -1,0 +1,1111 @@
+---
+title: "xALD single-cell atlas -- Part 4: T cells"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/04_tcells.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 10, dpi = 150)
+```
+
+# Part 4: T cells
+
+## 4.1 Parameters
+
+```{r tcell-params}
+tcell_params <- list(
+  celltype_var   = "celltypes",
+  donor_var      = "patient_ID",
+  diagnosis_var  = "diagnosis",
+  lineage_levels = c("CD4+T-Cells", "CD8+T-Cells"),
+  resolutions    = c(0.6, 1.6, 2.4, 2.6),
+  base_res       = c(CSF = 2.4, PBMC = 1.6),
+  seed           = c(CSF = 1, PBMC = 1)
+)
+```
+
+## 4.2 Marker panels
+
+```{r panels}
+ref_markers_wu <- list(
+  "Lineage"        = c("CD3D","CD3E","CD4","CD40LG","CD8A","CD8B"),
+
+  "Naive core"     = c("CCR7","SELL","LEF1","TCF7","NELL2","MAL",
+                       "NOSIP","TRABD2A","ACTN1","PECAM1"),
+  "Memory core"    = c("IL32","ITGB1","CRIP1","LMNA","AQP3"),
+
+  "CD4 TCM"        = c("IL7R","GPR183","CD27","LTB","TRADD"),
+  "CD4 TEM"        = c("ANXA1","S100A4","GZMA","CCL5","CST7","CXCR3","CCR5"),
+  "CD4 T-Helper"   = c("TBX21","GATA3","RORC","CCR6","CXCR5"),
+  "Treg"           = c("FOXP3","IL2RA","IKZF2","CTLA4","TIGIT","RTKN2","ENTPD1"),
+
+  "CD8 naive"      = c("LINC02446","PTPRK","NRCAM"),
+  "CD8 memory"     = c("GZMK","CMC1","EOMES","LYAR","HLA-DRB1"),
+  "CD8 effector"   = c("GZMB","GZMH","PRF1","NKG7","GNLY","FGFBP2",
+                       "CX3CR1","FCGR3A"),
+  "CD8 TEMRA"      = c("ZEB2","S1PR5","ADGRG1","B3GAT1","KLRG1","PLEK"),
+
+  "TRM"            = c("CD69","ITGAE","ITGA1","ZNF683","CXCR6","RGS1","PDCD1"),
+  "MAIT"           = c("TRAV1-2","SLC4A10","ZBTB16","NCR3","DPP4","ME1","KLRB1"),
+  "gdT"            = c("TRDC","TRGC1","TRGC2","TRDV1","TRDV2","TRGV9")
+)
+```
+
+## 4.3 Load and subset
+
+```{r tcells-cache-check}
+tcells_clustered_output <- file.path(path$objects, "07R_t_cells_clustered.qs")
+tcells_output <- file.path(path$objects, "07R_t_cells_filtered_xALD.qs")
+tcells_force_recompute <- FALSE
+tcells_cached <- file.exists(tcells_output) && !tcells_force_recompute
+if (tcells_cached) t_cells_filtered <- qread(tcells_output)
+```
+
+```{r load, eval=!tcells_cached}
+t_cells <- lapply(qread(file.path(path$objects, "03R_xALD_filtered_integrated.qs")), function(o) {
+  o <- subset(o, cells = colnames(o)[o@meta.data[[tcell_params$celltype_var]] %in% tcell_params$lineage_levels])
+  o$lineage <- droplevels(factor(as.character(o@meta.data[[tcell_params$celltype_var]]),
+                                 levels = tcell_params$lineage_levels))
+  o
+})
+invisible(gc())
+sapply(t_cells, ncol)
+```
+
+## 4.4 Embedding and clustering
+
+```{r cluster-run, eval=!tcells_cached}
+set.seed(42)
+t_cells <- imap(t_cells, function(so, ti)
+  lineage_cluster(lineage_embed(so), tcell_params$resolutions, tcell_params$base_res[[ti]], tcell_params$seed[[ti]]))
+
+purrr::imap_dfr(t_cells, function(o, n) tibble(
+  compartment = n, resolution = tcell_params$resolutions,
+  n_clusters = sapply(tcell_params$resolutions, function(r) dplyr::n_distinct(o[[lineage_res_col(r)]][, 1])),
+  knn_purity = sapply(tcell_params$resolutions, function(r) round(knn_purity(o, lineage_res_col(r)), 4))))
+lapply(t_cells, function(so) table(so$seurat_clusters))
+qsave(t_cells, tcells_clustered_output)
+```
+
+```{r seed-stability, eval=!tcells_cached}
+purrr::imap_dfr(t_cells, function(so, ti)
+  lineage_seed_stability(so, tcell_params$base_res[[ti]], tcell_params$seed[[ti]]) %>% mutate(tissue = ti, .before = 1))
+```
+
+```{r cluster-umaps, fig.width = 7, fig.height = 6, eval=!tcells_cached}
+purrr::imap(t_cells, function(so, cmp)
+  purrr::map(lineage_res_col(tcell_params$resolutions), ~ plot_clusters(so, .x) + labs(subtitle = cmp)))
+```
+
+## 4.5 Cluster evidence
+
+```{r qc-covariates, fig.width = 6, fig.height = 5, eval=!tcells_cached}
+purrr::imap(t_cells, function(so, cmp)
+  purrr::map(intersect(c("diagnosis", "patient_ID", "date_of_sequencing"), colnames(so@meta.data)), function(v)
+    DimPlot_scCustom(so, group.by = v, reduction = "umap_harmony") + labs(subtitle = cmp)))
+
+purrr::iwalk(t_cells, function(obj, compartment) {
+  p <- plot_qc_umap(obj, title = compartment)
+  print(p)
+  ggsave(file.path(path$graphs_tcells, paste0("qc_umap_", tolower(compartment), ".png")),
+         p, width = 12, height = 10, dpi = 300)
+})
+```
+
+```{r cluster-markers, eval=!tcells_cached}
+markers_t <- lapply(t_cells, top_markers_by_cluster)
+lapply(markers_t, as.data.frame)
+```
+
+```{r cluster-evidence, eval=!tcells_cached, fig.width = 16, fig.height = 10}
+iwalk(t_cells, function(so, ti)
+  print(dotplot_modules(so, "seurat_clusters",
+                        c(ref_markers_wu, list(Platelet = LINEAGE_EVIDENCE_GENES$platelet)),
+                        title = ti, cluster_order = levels(droplevels(so$seurat_clusters)))))
+
+tc_cluster_qc <- imap_dfr(t_cells, function(so, ti)
+  cluster_evidence(so) %>%
+    left_join(so@meta.data %>% group_by(seurat_clusters = as.character(seurat_clusters)) %>%
+                summarise(cd8_share = mean(lineage == "CD8+T-Cells"), .groups = "drop"), by = "seurat_clusters") %>%
+    mutate(tissue = ti, .before = 1))
+tc_cluster_qc %>% mutate(across(where(is.double), ~ round(.x, 2))) %>% print(n = Inf, width = Inf)
+```
+
+## 4.6 Labels
+
+```{r cluster-labels, eval=!tcells_cached}
+cluster_names <- list(
+  CSF = c(
+  ),
+  PBMC = c(
+  )
+)
+
+tc_removed <- tibble::tribble(
+  ~tissue, ~seurat_clusters, ~reason
+)
+
+check_cluster_map(t_cells, cluster_names, tc_removed)
+
+tc_removed %>%
+  left_join(tc_cluster_qc, by = c("tissue", "seurat_clusters")) %>%
+  mutate(across(where(is.double), ~ round(.x, 3))) %>%
+  write_csv(file.path(path$tables, "tcells_cluster_review.csv"))
+```
+
+```{r apply-labels, eval=!tcells_cached}
+t_cells_filtered <- imap(t_cells, function(so, ti) apply_cluster_map(so, cluster_names[[ti]], "celltype"))
+qsave(t_cells_filtered, tcells_output)
+rm(t_cells); invisible(gc())
+```
+
+```{r csf-pbmc-handles, fig.width = 8, fig.height = 6}
+csf  <- t_cells_filtered$CSF
+pbmc <- t_cells_filtered$PBMC
+lapply(t_cells_filtered, function(so) table(so$celltype, so$diagnosis))
+imap(t_cells_filtered, ~ DimPlot_scCustom(.x, group.by = "celltype", reduction = "umap_harmony", label = TRUE) + ggtitle(.y))
+```
+
+### 4.6.1 Label order
+
+```{r label-order}
+lineage_of <- function(x)
+  ifelse(grepl("^CD4|^Treg|^Th17", x), "CD4", ifelse(grepl("^CD8", x), "CD8", "other"))
+state_rank <- function(x) {
+  ord <- c("naive", "T-Helper", "Effector", "Memory", "TEMRA", "Treg", "Th17")
+  vapply(x, function(s) {
+    m <- which(vapply(paste0("\\b", ord, "\\b"), grepl, logical(1), x = s, ignore.case = TRUE))
+    if (length(m)) m[1] else length(ord) + 1L
+  }, integer(1))
+}
+info <- data.frame(ct = sort(unique(c(as.character(csf$celltype), as.character(pbmc$celltype)))),
+                   stringsAsFactors = FALSE)
+info$grp <- factor(lineage_of(info$ct), levels = c("CD4", "CD8", "other"))
+info <- info[order(info$grp, state_rank(info$ct), info$ct), ]
+all_labels_csf <- all_labels_pbmc <- info$ct
+info
+```
+
+## 4.7 Marker validation
+
+### 4.7.1 Dot plots
+
+```{r dotplot-all, fig.width = 24, fig.height = 9}
+p_dot_all <- dotplot_modules(csf, "celltype", ref_markers_wu,
+                             title = "CSF T/NK cell populations - marker validation",
+                             cluster_order = all_labels_csf)
+p_dot_all
+ggsave(file.path(path$graphs_tcells, "qc_dotplot_csf_all.png"), p_dot_all, width = 24, height = 9)
+
+p_dot_all_pbmc <- dotplot_modules(pbmc, "celltype", ref_markers_wu,
+                             title = "PBMC T/NK cell populations - marker validation",
+                             cluster_order = all_labels_pbmc)
+p_dot_all_pbmc
+ggsave(file.path(path$graphs_tcells, "qc_dotplot_pbmc_all.png"), p_dot_all_pbmc , width = 24, height = 9)
+```
+
+### 4.7.2 Lineage heatmaps and dot plots
+
+```{r dotplot, fig.width = 18, fig.height = 15}
+obj      <- t_cells_filtered$CSF
+group_by <- "celltype"
+assay    <- "RNA"
+cap      <- 2
+scale_within_panel <- TRUE
+
+modules_cd4 <- list(
+  "Lineage"       = c("CD4", "CD40LG"),
+  "Naive / Tcm"   = c("CCR7", "TCF7", "SELL", "LEF1"),
+  "Memory"        = c("S100A4", "ANXA1", "AQP3"),
+  "Residency"     = c("CD69", "CXCR6", "ITGAE", "RGS1"),
+  "Th1 / effector"= c("IFNG-AS1", "IFNG", "GZMK", "CCL5", "GZMA"),
+  "Treg"          = c("FOXP3", "IL2RA", "IKZF2", "CTLA4", "TIGIT", "RTKN2"))
+
+modules_cd8 <- list(
+  "Lineage"       = c("CD8A", "CD8B"),
+  "Naive / Tcm"   = c("CCR7", "TCF7", "LEF1", "NELL2", "MAL"),
+  "Memory"        = c("S100A4", "IL7R"),
+  "Residency"     = c("CD69", "CXCR6", "ITGAE", "ZNF683"),
+  "Cytotoxic"     = c("CCL5", "NKG7", "GZMA"),
+  "Eff. GZMK+"    = c("GZMK", "CMC1", "EOMES"),
+  "Eff. late"     = c("CX3CR1", "FGFBP2", "KLRG1"),
+  "MAIT"          = c("SLC4A10", "TRAV1-2", "KLRB1", "RORC"),
+  "\u03b3\u03b4"  = c("TRDC", "TRGC1", "TRDV2")
+)
+
+pops     <- levels(factor(obj@meta.data[[group_by]]))
+cd8_pops <- grep("CD8|MAIT|\u03b3\u03b4|gdT|GDT", pops, value = TRUE)
+cd4_pops <- setdiff(pops, cd8_pops)
+
+message("CD8 panel: ", paste(cd8_pops, collapse = " | "))
+message("CD4 panel: ", paste(cd4_pops, collapse = " | "))
+
+panel_df <- function(pops_use, modules) {
+
+  map <- data.frame(
+    gene   = unlist(modules, use.names = FALSE),
+    module = rep(names(modules), lengths(modules)),
+    stringsAsFactors = FALSE
+  )
+  miss <- setdiff(map$gene, rownames(obj[[assay]]))
+  if (length(miss)) message("Not in assay, dropped: ", paste(miss, collapse = ", "))
+  map <- map[map$gene %in% rownames(obj[[assay]]), ]
+
+  o <- obj
+  if (scale_within_panel) {
+    keep <- colnames(obj)[obj@meta.data[[group_by]] %in% pops_use]
+    o <- subset(obj, cells = keep)
+    o@meta.data[[group_by]] <- droplevels(factor(o@meta.data[[group_by]]))
+  }
+
+  d <- DotPlot(o, features = map$gene, group.by = group_by, assay = assay)$data
+  d <- d[d$id %in% pops_use, ]
+  d$gene <- as.character(d$features.plot)
+
+  bad <- tapply(d$avg.exp.scaled, d$gene, function(x) all(!is.finite(x)))
+  if (any(bad)) {
+    message("Zero variance in this panel, dropped: ",
+            paste(names(bad)[bad], collapse = ", "))
+    d   <- d[!d$gene %in% names(bad)[bad], ]
+    map <- map[!map$gene %in% names(bad)[bad], ]
+  }
+
+  d$module <- map$module[match(d$gene, map$gene)]
+  d$gene   <- factor(d$gene,   levels = rev(map$gene))
+  d$module <- factor(d$module, levels = names(modules))
+  d$id     <- factor(as.character(d$id), levels = pops_use)
+  d$expr   <- pmin(pmax(d$avg.exp.scaled, -cap), cap)
+  d
+}
+
+panel_plot <- function(d, title) {
+  ggplot(d, aes(x = id, y = gene, fill = expr)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    facet_grid(rows = vars(module), scales = "free_y", space = "free_y", switch = "y") +
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "grey96", high = "#B2182B", midpoint = 0,
+      limits = c(-cap, cap), breaks = c(-cap, 0, cap),
+      name   = "Scaled\nexpression",
+      guide  = guide_colourbar(barwidth = 0.6, barheight = 6, ticks = FALSE)
+    ) +
+    scale_x_discrete(position = "top", expand = c(0, 0),
+                     labels = function(x) str_wrap(x, width = 16)) +
+    scale_y_discrete(expand = c(0, 0)) +
+    labs(x = NULL, y = NULL, title = title) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title        = element_text(size = 11, face = "bold", hjust = 0,
+                                       margin = margin(b = 8)),
+      panel.grid        = element_blank(),
+      panel.spacing.y   = unit(3, "pt"),
+      strip.placement   = "outside",
+      strip.text.y.left = element_text(angle = 0, hjust = 1, size = 9, colour = "grey25"),
+      strip.background  = element_blank(),
+      axis.text.x.top   = element_text(angle = 45, hjust = 0, vjust = 0,
+                                       size = 9, colour = "black"),
+      axis.text.y       = element_text(face = "italic", colour = "black", size = 9),
+      axis.ticks        = element_blank(),
+      legend.title      = element_text(size = 9),
+      legend.text       = element_text(size = 8),
+      plot.margin       = margin(10, 14, 6, 6)
+    )
+}
+
+d_cd4 <- panel_df(cd4_pops, modules_cd4)
+d_cd8 <- panel_df(cd8_pops, modules_cd8)
+
+p_cd4 <- panel_plot(d_cd4, "CD4 T cells and Treg")
+p_cd8 <- panel_plot(d_cd8, "CD8 T cells, MAIT and \u03b3\u03b4 T")
+
+print(p_cd4)
+print(p_cd8)
+
+private_markers <- function(d) {
+  z <- acast(d, gene ~ id, value.var = "expr")
+  vapply(colnames(z), function(cl) {
+    own <- rownames(z)[colnames(z)[apply(z, 1, which.max)] == cl]
+    if (!length(own)) NA_character_
+    else sprintf("%s (%.2f)", own[which.max(z[own, cl])], max(z[own, cl]))
+  }, character(1))
+}
+
+qc <- rbind(
+  data.frame(panel = "CD4", population = cd4_pops,
+             top_private_marker = private_markers(d_cd4)[cd4_pops]),
+  data.frame(panel = "CD8", population = cd8_pops,
+             top_private_marker = private_markers(d_cd8)[cd8_pops])
+)
+print(qc, row.names = FALSE)
+
+min_pct  <- 0
+use_viridis <- FALSE
+
+panel_dotplot <- function(d, title) {
+
+  d <- d[is.finite(d$expr), ]
+  if (min_pct > 0) d <- d[d$pct.exp >= min_pct, ]
+
+  fill_scale <- if (use_viridis) {
+    scale_colour_viridis_c(
+      option = "D", limits = c(-cap, cap), breaks = c(-cap, 0, cap),
+      name  = "Scaled\nexpression",
+      guide = guide_colourbar(barwidth = 0.6, barheight = 5, ticks = FALSE, order = 1)
+    )
+  } else {
+    scale_colour_gradient2(
+      low = "#2166AC", mid = "grey85", high = "#B2182B", midpoint = 0,
+      limits = c(-cap, cap), breaks = c(-cap, 0, cap),
+      name  = "Scaled\nexpression",
+      guide = guide_colourbar(barwidth = 0.6, barheight = 5, ticks = FALSE, order = 1)
+    )
+  }
+
+  ggplot(d, aes(x = id, y = gene)) +
+    geom_point(aes(size = pct.exp, colour = expr)) +
+    facet_grid(rows = vars(module), scales = "free_y", space = "free_y", switch = "y") +
+    fill_scale +
+    scale_size_continuous(
+      range = c(0.3, 6), limits = c(0, 100), breaks = c(0, 25, 50, 75, 100),
+      name  = "% cells\nexpressing",
+      guide = guide_legend(order = 2, override.aes = list(colour = "grey30"))
+    ) +
+    scale_x_discrete(position = "top", expand = expansion(add = 0.6),
+                     labels = function(x) str_wrap(x, width = 16)) +
+    scale_y_discrete(expand = expansion(add = 0.6)) +
+    labs(x = NULL, y = NULL, title = title) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title        = element_text(size = 11, face = "bold", hjust = 0,
+                                       margin = margin(b = 8)),
+      panel.grid.major  = element_line(colour = "grey93", linewidth = 0.3),
+      panel.grid.minor  = element_blank(),
+      panel.border      = element_rect(colour = "grey85", fill = NA, linewidth = 0.4),
+      panel.spacing.y   = unit(2, "pt"),
+      strip.placement   = "outside",
+      strip.text.y.left = element_text(angle = 0, hjust = 1, size = 9, colour = "grey25"),
+      strip.background  = element_blank(),
+      axis.text.x.top   = element_text(angle = 45, hjust = 0, vjust = 0,
+                                       size = 9, colour = "black"),
+      axis.text.y       = element_text(face = "italic", colour = "black", size = 9),
+      axis.ticks        = element_blank(),
+      legend.title      = element_text(size = 9),
+      legend.text       = element_text(size = 8),
+      legend.key        = element_blank(),
+      plot.margin       = margin(10, 14, 6, 6)
+    )
+}
+
+dp_cd4 <- panel_dotplot(d_cd4, "CD4 T cells and Treg")
+dp_cd8 <- panel_dotplot(d_cd8, "CD8 T cells, MAIT and \u03b3\u03b4 T")
+
+print(dp_cd4)
+print(dp_cd8)
+
+ggsave(file.path(path$graphs_tcells, "dotplot_CD4.png"), dp_cd4, width = 6.2,
+        height = 1.8 + 0.28 * nlevels(droplevels(d_cd4$gene)))
+ggsave(file.path(path$graphs_tcells, "dotplot_CD8.png"), dp_cd8, width = 6.2,
+        height = 1.8 + 0.28 * nlevels(droplevels(d_cd8$gene)))
+ggsave(file.path(path$graphs_tcells, "heatmap_CD4.png"), p_cd4, width = 6.2,
+       height = 1.8 + 0.28 * nlevels(droplevels(d_cd4$gene)))
+ggsave(file.path(path$graphs_tcells, "heatmap_CD8.png"), p_cd8, width = 6.2,
+       height = 1.8 + 0.28 * nlevels(droplevels(d_cd8$gene)))
+```
+
+## 4.8 Main figures
+
+### 4.8.1 Labelled UMAP panels
+
+```{r umap-panels-tcells}
+stopifnot(all(vapply(t_cells_filtered, function(so)
+  "celltype" %in% colnames(so@meta.data), logical(1))))
+
+fig_t_umap <- umap_compartment_figure(t_cells_filtered, label_col = "celltype",
+                                      stem = "umap_tcells_panels",
+                                      level_title = "T cells",
+                                      dir = path$graphs_tcells)
+print(fig_t_umap$figure)
+store_figure_panels("tcells", "umap", fig_t_umap)
+```
+
+### 4.8.2 Marker dot panels
+
+```{r dot-panels-tcells}
+dot_markers_t <- list(
+  "CD4 Naive/TCM early"              = c("CCR7", "SELL", "LEF1"),
+  "CD4 TCM"                          = c("IL7R", "GPR183"),
+  "CD4 TEM"                          = c("ANXA1", "S100A4"),
+  "CD4 TEM (CXCR6+, residency-like)" = c("CXCR6", "RGS1"),
+  "CD4 TEM (HLA-DRB+)"               = c("HLA-DRB1", "HLA-DRA"),
+  "Treg"                             = c("FOXP3", "IL2RA", "CTLA4"),
+  "CD8 Naive/TCM"                    = c("CD8B", "LINC02446", "NELL2"),
+  "CD8 TEM (GZMK+)"                  = c("GZMK", "EOMES"),
+  "CD8 TEM (GZMB+)"                  = c("GZMB", "PRF1", "FGFBP2"),
+  "CD8 TEM (CXCR6+, residency-like)" = c("ZNF683", "ITGAE"),
+  "gdT"                              = c("TRDC", "TRGC1"),
+  "MAIT"                             = c("SLC4A10", "KLRB1"))
+
+dots_t <- dot_compartment_figure(t_cells_filtered, dot_markers_t, "celltype",
+                                 stem = "dot_tcells", umap_fig = fig_t_umap,
+                                 extra = list(Lineage = c("CD3E", "CD4", "CD8A")),
+                                 dir = path$graphs_tcells)
+for (d in dots_t) print(d$figure)
+store_figure_panels("tcells", "dots", dots_t)
+```
+
+## 4.9 Composition
+
+### 4.9.1 Differential abundance (edgeR, NB with log total offset)
+
+```{r ab-fit, fig.width=12, fig.height=6}
+par_ab <- list(
+  label_col       = "celltype",
+  donor_col       = "patient_ID",
+  group_col       = "diagnosis",
+  compartment_col = "compartment",
+  strat_col       = "severity_active",
+  ref_group       = "control",
+  min_cells       = 5,
+  min_samples     = 0.5,
+  fdr             = 0.05,
+  ext_totals      = NULL)
+meta_all <- ab_get_meta(lapply(t_cells_filtered, add_severity, quiet = TRUE), par_ab$compartment_col)
+
+ab_t <- list()
+for (ti in c("CSF", "PBMC")) {
+  ab <- build_abundance_inputs(
+    meta_all, compartment_col = par_ab$compartment_col, focus = ti,
+    donor_col = par_ab$donor_col, group_col = par_ab$group_col,
+    label_col = par_ab$label_col, strat_col = par_ab$strat_col,
+    ref_group = par_ab$ref_group, min_cells = par_ab$min_cells,
+    min_samples = par_ab$min_samples, ext_totals = par_ab$ext_totals)
+  design <- model.matrix(~ group, data = ab$sinfo)
+  colnames(design) <- make.names(colnames(design))
+  res <- fit_ab(ab$mat, ab$sinfo, ab$totals, design,
+                coef = setdiff(colnames(design), "X.Intercept.")[1], fdr = par_ab$fdr)
+  print(knitr::kable(cbind(ab$mat, total = ab$totals), caption = paste("Cell counts per donor -", ti)))
+  print(knitr::kable(res %>% arrange(FDR) %>% select(celltype, logFC, ci_lo, ci_hi, PValue, FDR),
+                     digits = 3, caption = paste("X-ALD vs control,", ti, "- log2 FC in proportion")))
+  comp <- ab_compositional(ab, res) %>% dplyr::mutate(tissue = ti, .before = 1)
+  fig  <- ab_res_for_figure(res, comp)
+  print(plot_ab_figure(
+    ab$long, fig$res, ab$totals, pal = umap_palette_for(fig_t_umap, ti, ab$long$celltype),
+    title_a = "Per-donor composition", title_b_prefix = paste0("X-ALD vs control, ", fig$method),
+    y_lab = paste("proportion of", ti, "T cells"), fdr = par_ab$fdr, x_lab = fig$x_lab, ci_label = fig$ci_label,
+    out_file = file.path(path$graphs_tcells, paste0("t_cell_per_donor_", fig$method, "_", ti, ".jpg"))))
+  ab_t[[ti]] <- list(inputs = ab, res = res, comp = comp, res_fig = fig$res, method = fig$method, x_lab = fig$x_lab)
+}
+
+store_figure_panels("tcells", "abundance", abundance_figure_panels(
+  ab_t, umap_fig = fig_t_umap, ref_group = par_ab$ref_group,
+  contrast = "X-ALD vs control", fdr = par_ab$fdr, y_lab = "proportion of T cells"))
+```
+
+### 4.9.2 Compositional check
+
+```{r ab-compositional}
+comp_t <- dplyr::bind_rows(lapply(ab_t, `[[`, "comp"))
+readr::write_csv(comp_t, file.path(path$tables, "abundance_tcells_compositional.csv"))
+knitr::kable(comp_t, digits = 3, caption = "T cells, X-ALD vs control: share vs compositional tests")
+```
+
+### 4.9.3 Stage 3 vs stages 1-2, within X-ALD
+
+```{r tcell-ab-sev, fig.width = 11, fig.height = 5}
+ab_t_sev <- run_ab_sev(meta_all, par_ab, c("CSF", "PBMC"), tag = "tcell",
+                       ext_totals = par_ab$ext_totals, fig = fig_t_umap, fig_dir = path$graphs_tcells)
+```
+
+### 4.9.4 Composition by severity stage
+
+```{r tcell-ab-by-severity, fig.width = 9, fig.height = 6}
+plot_ab_by_severity(meta_all, "celltype", title = "T cells by severity stage", levels = all_labels_csf,
+                    umap_fig = fig_t_umap,
+                    out_file = file.path(path$graphs_tcells, "t_cell_abundance_by_severity.png"))
+```
+
+### 4.9.5 CSF vs PBMC, paired donors
+
+```{r abundance-paired, fig.width = 12, fig.height = 7}
+paired_t <- ab_paired_compartment(t_cells_filtered, "celltype")
+knitr::kable(paired_t$res %>% mutate(across(c(median_CSF, median_PBMC), ~ round(100 * .x, 2)), log2OR = round(log2OR, 2)) %>%
+               select(celltype, `%CSF` = median_CSF, `%PBMC` = median_PBMC, log2OR, p.value, padj), digits = 4)
+paired_t$propeller
+readr::write_csv(paired_t$by_dx, file.path(path$tables, "abundance_tcells_csf_vs_pbmc.csv"))
+p_paired_t <- plot_ab_paired(paired_t, order = all_labels_csf, what = "T cells", stem = "t_cell_csf_vs_pbmc",
+                             dir = path$graphs_tcells)
+p_paired_t$forest; p_paired_t$pairs
+```
+
+### 4.9.6 Per-donor composition
+
+```{r composition-donor, fig.width = 14, fig.height = 6}
+comp_donor <- meta_all |>
+  dplyr::transmute(compartment, donor = patient_ID, diagnosis, label = factor(celltype)) |>
+  dplyr::count(compartment, donor, diagnosis, label, name = "n", .drop = FALSE) |>
+  dplyr::group_by(compartment, donor) |>
+  dplyr::mutate(n_donor = sum(n), pct = 100 * n / n_donor) |>
+  dplyr::ungroup() |>
+  dplyr::filter(n_donor >= 100)
+
+comp_donor |>
+  dplyr::group_by(label, compartment) |>
+  dplyr::summarise(mean_pct = mean(pct), sd_pct = stats::sd(pct), n_donors = dplyr::n(), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = compartment, values_from = c(mean_pct, sd_pct, n_donors)) |>
+  knitr::kable(digits = 2, caption = "Composition per donor (mean +/- SD)")
+
+p_stack <- ggplot2::ggplot(comp_donor, ggplot2::aes(x = donor, y = pct, fill = label)) +
+  ggplot2::geom_col(width = 0.85) +
+  ggplot2::facet_grid(~ compartment + diagnosis, scales = "free_x", space = "free_x") +
+  ggplot2::labs(x = NULL, y = "Share of T cells (%)", fill = NULL) +
+  ggplot2::theme_classic(base_size = 11) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+p_stack
+ggsave(file.path(path$graphs_tcells, "t_cell_comp_donors.jpg"), width = 16, height = 8)
+```
+
+## 4.10 Pseudobulk DEG (DESeq2)
+
+```{r deg-constants}
+CELLTYPE_COL     <- "celltype"
+MIN_CELLS_SAMPLE <- DEG_MIN_CELLS_PER_SAMPLE
+if (!exists("MIN_CELLS_SUBSET")) MIN_CELLS_SUBSET <- DEG_MIN_CELLS
+if (!exists("SIG_COL"))          SIG_COL          <- "padj"
+if (!exists("PADJ_T"))           PADJ_T           <- DEG_PADJ_THRESH
+if (!exists("LFC_T"))            LFC_T            <- DEG_LFC_THRESH
+if (!exists("MASK_CLASSES"))     MASK_CLASSES     <- DEG_MASK_CLASSES
+```
+
+### 4.10.1 Metadata: severity and CD4/CD8 lineage
+
+```{r deg-meta}
+if (!exists("t_cells_filtered"))
+  t_cells_filtered <- qs::qread(tcells_output)
+
+t_cells_DEG <- lapply(t_cells_filtered, function(so) {
+  so <- add_severity(so)
+  so$sev_grp <- sev_group3(so$severity)
+  stopifnot(CELLTYPE_COL %in% colnames(so@meta.data))
+  ct <- as.character(so@meta.data[[CELLTYPE_COL]])
+  both <- grepl("CD4", ct, ignore.case = TRUE) & grepl("CD8", ct, ignore.case = TRUE)
+  so$lineage <- dplyr::case_when(
+    both | grepl("\\bDN\\b|double.neg", ct, ignore.case = TRUE) ~ NA_character_,
+    grepl("Treg|CD4", ct, ignore.case = TRUE)                       ~ "CD4",
+    grepl("CD8", ct, ignore.case = TRUE)                            ~ "CD8",
+    TRUE                                                            ~ NA_character_)
+  if (all(is.na(so$lineage)))
+    stop("No CD4/CD8 labels matched in '", CELLTYPE_COL, "'. Labels present: ", paste(unique(ct), collapse = ", "))
+  so
+})
+lapply(t_cells_DEG, function(so) table(so@meta.data[[CELLTYPE_COL]], so$lineage, useNA = "ifany"))
+
+donors_in_fit <- function(meta, by) colSums(table(meta$patient_ID, interaction(meta[by], drop = TRUE)) >= MIN_CELLS_SAMPLE)
+severity_report(t_cells_DEG, "tcells")
+lapply(t_cells_DEG, function(so) donors_in_fit(so@meta.data, "sev_grp"))
+lapply(t_cells_DEG, function(so) donors_in_fit(so@meta.data[!is.na(so$lineage), ], c("lineage", "sev_grp")))
+```
+
+### 4.10.2 Fits
+
+```{r deg-run}
+deg_label_of <- function(x) {
+  lab <- unlist(c(deg_contrast_labels, if (exists("DEG_SEVERITY_LABELS")) DEG_SEVERITY_LABELS))
+  out <- unname(lab[x]); out[is.na(out)] <- x[is.na(out)]
+  stats::setNames(as.list(out), x)
+}
+tissues <- names(t_cells_DEG)
+gs_units_t <- deg_loo_units(t_cells_DEG, tissues, "all_T", CELLTYPE_COL, lineage_col = "lineage",
+                            min_cells = MIN_CELLS_SUBSET)
+deg_all <- dplyr::bind_rows(lapply(gs_units_t, function(u) {
+  message(u$tissue, " / ", u$level, " / ", u$subset)
+  flatten_contrasts(run_all_contrasts(u$get()), u$tissue, u$level, u$subset)
+}))
+```
+
+### 4.10.3 Collect
+
+```{r deg-collect}
+deg_all <- collect_deg_results(deg_all, csv_prefix = file.path(path$tables, "DEG_tcells"))
+contrast_labels <- deg_label_of(sort(unique(deg_all$comparison)))
+
+deg_all %>%
+  group_by(tissue, level, subset, comparison) %>%
+  summarise(ok = dplyr::first(status) == "ok", .groups = "drop") %>%
+  dplyr::count(comparison, ok)
+
+sig <- deg_all %>% filter(status == "ok", deg_is_sig(.data[[SIG_COL]], log2FC, PADJ_T, LFC_T))
+sig_main <- sig %>% filter(!gene_class %in% MASK_CLASSES)
+```
+
+#### Contrast inventory
+
+```{r}
+inventory <- deg_all %>%
+  filter(status == "ok") %>%
+  group_by(tissue, level, subset, comparison) %>%
+  summarise(
+    genes_tested  = n(),
+    sig           = sum(deg_is_sig(padj, log2FC, PADJ_T, LFC_T), na.rm = TRUE),
+    sig_main      = sum(deg_is_sig(padj, log2FC, PADJ_T, LFC_T) &
+                        !gene_class %in% MASK_CLASSES, na.rm = TRUE),
+    sig_highlight = sum(deg_is_highlight(padj, log2FC, PADJ_T, LFC_T, svalue = svalue) &
+                        !gene_class %in% MASK_CLASSES, na.rm = TRUE),
+    per_1k_tested = round(1000 * sig / genes_tested, 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(sig))
+
+inventory
+```
+
+#### Common gene universe
+
+```{r}
+common_universe <- deg_all %>%
+  filter(status == "ok", level == "celltype") %>%
+  group_by(tissue, comparison) %>%
+  group_modify(function(df, key) {
+    n_sub <- n_distinct(df$subset)
+    keep  <- df %>% count(gene) %>% filter(n == n_sub) %>% pull(gene)
+    df %>%
+      filter(gene %in% keep, !gene_class %in% MASK_CLASSES) %>%
+      group_by(subset) %>%
+      summarise(universe = length(keep),
+                up   = sum(deg_is_sig(padj, log2FC, PADJ_T, LFC_T) & log2FC > 0, na.rm = TRUE),
+                down = sum(deg_is_sig(padj, log2FC, PADJ_T, LFC_T) & log2FC < 0, na.rm = TRUE),
+                .groups = "drop")
+  }) %>%
+  ungroup()
+
+common_universe
+```
+
+#### Recurrence across cell types
+
+```{r}
+recurrence <- sig_main %>%
+  filter(level == "celltype") %>%
+  group_by(tissue, comparison, gene) %>%
+  summarise(n_celltypes   = n_distinct(subset),
+            celltypes     = paste(sort(unique(subset)), collapse = ", "),
+            direction     = paste(sort(unique(ifelse(log2FC > 0, "up", "down"))), collapse = "/"),
+            median_log2FC = round(median(log2FC), 2),
+            .groups = "drop") %>%
+  filter(n_celltypes >= 2) %>%
+  arrange(tissue, comparison, desc(n_celltypes))
+
+head(recurrence, 20)
+```
+
+### 4.10.4 Volcano plots
+
+```{r deg-headline}
+deg_headline <- deg_all %>% dplyr::filter(status == "ok", !gene_class %in% MASK_CLASSES)
+sev_note <- function(cmp) if (is_sev3_comparison(cmp)) SEV_CONFOUND_NOTE else NULL
+```
+
+```{r deg-volcano-allT, fig.width = 8, fig.height = 7}
+for (ti in tissues) {
+  for (cmp in names(contrast_labels)) {
+    df <- deg_headline %>% dplyr::filter(tissue == ti, level == "all_T", comparison == cmp)
+    if (nrow(df) < 5) next
+    p <- plot_volcano(df, title = paste(ti, "- all T cells -", contrast_labels[[cmp]]),
+                      lfc_col = "log2FC", padj_col = "padj", gene_col = "gene",
+                      subtitle = sev_note(cmp))
+    print(p)
+    ggsave(file.path(path$graphs_tcells, paste0("volcano_allT_", ti, "_", cmp, ".png")),
+           p, width = 8, height = 7, dpi = 300)
+  }
+}
+```
+
+```{r deg-volcano-lineage, fig.width = 8, fig.height = 7}
+for (ti in tissues) {
+  for (lin in c("CD4", "CD8")) {
+    for (cmp in names(contrast_labels)) {
+      df <- deg_headline %>%
+        dplyr::filter(tissue == ti, level == "lineage", subset == lin, comparison == cmp)
+      if (nrow(df) < 5) next
+      p <- plot_volcano(df, title = paste(ti, "-", lin, "-", contrast_labels[[cmp]]),
+                        lfc_col = "log2FC", padj_col = "padj", gene_col = "gene",
+                        subtitle = sev_note(cmp))
+      print(p)
+      ggsave(file.path(path$graphs_tcells, paste0("volcano_lineage_", ti, "_", lin, "_", cmp, ".png")),
+             p, width = 8, height = 7, dpi = 300)
+    }
+  }
+}
+```
+
+```{r deg-volcano-celltype, fig.width = 8, fig.height = 7}
+for (ti in tissues) {
+  cts <- deg_headline %>%
+    dplyr::filter(tissue == ti, level == "celltype") %>%
+    dplyr::pull(subset) %>% unique() %>% sort()
+
+  for (ct in cts) {
+    for (cmp in names(contrast_labels)) {
+      df <- deg_headline %>%
+        dplyr::filter(tissue == ti, level == "celltype", subset == ct, comparison == cmp)
+      if (nrow(df) < 5) next
+      p <- plot_volcano(df, title = paste(ti, "-", ct, "-", contrast_labels[[cmp]]),
+                        lfc_col = "log2FC", padj_col = "padj", gene_col = "gene",
+                        subtitle = sev_note(cmp))
+      print(p)
+      ggsave(file.path(path$graphs_tcells,
+                       paste0("volcano_celltype_", ti, "_", sanitize(ct), "_", cmp, ".png")),
+             p, width = 8, height = 7, dpi = 300)
+    }
+  }
+}
+```
+
+### 4.10.5 DEG counts per cell type
+
+```{r deg-summary-celltype, fig.width = 7, fig.height = 6}
+for (ti in tissues) {
+  for (cmp in names(contrast_labels)) {
+    df <- deg_headline %>% dplyr::filter(tissue == ti, level == "celltype", comparison == cmp)
+    if (nrow(df) < 5) next
+    p <- plot_deg_summary(df, group_col_name = "subset",
+                          title = paste(ti, "-", contrast_labels[[cmp]]),
+                          lfc_col = "log2FC", padj_col = "padj",
+                          subtitle = sev_note(cmp))
+    print(p)
+    ggsave(file.path(path$graphs_tcells, paste0("deg_summary_celltype_", ti, "_", cmp, ".png")),
+           p, width = 7, height = 6, dpi = 300)
+  }
+}
+```
+
+```{r deg-summary-all-contrasts, fig.width = 13, fig.height = 6}
+for (ti in tissues) {
+  df <- deg_headline %>% dplyr::filter(tissue == ti, level == "celltype")
+  if (nrow(df) < 5) next
+  p <- plot_deg_summary_all(
+    df, group_col_name = "subset", comparison_col = "comparison",
+    comparison_labels = contrast_labels,
+    title    = paste(ti, "- DEGs per celltype, all contrasts"),
+    subtitle = SEV_CONFOUND_NOTE,
+    lfc_col  = "log2FC", padj_col = "padj")
+  ggsave(file.path(path$graphs_tcells, paste0("deg_summary_all_contrasts_", ti, ".png")),
+         p, width = 13, height = 6, dpi = 300)
+  tryCatch(print(p), error = function(e)
+    message("print failed (saved to disk anyway): ", conditionMessage(e)))
+}
+```
+
+#### 4.10.5.1 Per-donor views
+
+```{r tcell-deg-donor, fig.width = 9, fig.height = 8}
+donor_lfc_t <- deg_donor_views(gs_units_t, deg_all, file.path(path$graphs_tcells, "deg_donor"), "tcells",
+                               contrasts = deg_report_contrasts(), stage_genes = deg_stage_genes("tcells"))
+readr::write_csv(donor_lfc_t, file.path(path$tables, "DEG_tcells_donor_lfc.csv.gz"))
+```
+
+## 4.11 Gene sets and TF activity
+
+```{r tcell-gs-inputs}
+if (!exists("deg_all"))
+  deg_all <- readr::read_csv(file.path(path$tables, "DEG_tcells_all_genes.csv"), show_col_types = FALSE)
+GS_CONTRASTS_T <- LINEAGE_GS_CONTRASTS
+miss <- setdiff(GS_CONTRASTS_T, unique(deg_all$comparison[deg_all$status == "ok"]))
+if (length(miss)) warning("not fitted in deg_all: ", toString(miss))
+GS_LEVELS_T <- c("all_T", "lineage", "celltype")
+if (!exists("gs_units_t"))
+  gs_units_t <- deg_loo_units(t_cells_DEG, names(t_cells_DEG), "all_T", CELLTYPE_COL, lineage_col = "lineage",
+                              min_cells = MIN_CELLS_SUBSET)
+cov_t <- lineage_covariates(t_cells_DEG)
+```
+
+### 4.11.1 Global-shift diagnostics
+
+```{r tcell-gs-shift-diagnostics, fig.width = 7.2, fig.height = 6}
+shift_t_report <- gs_shift_report(deg_all, t_cells_DEG, GS_CONTRASTS_T, GS_LEVELS_T, c("all_T", "lineage"),
+                                  CELLTYPE_COL, "tcells", path$graphs_tcells)
+```
+
+### 4.11.2 Gene-set tests
+
+```{r tcell-gs-run}
+gs_universe_t <- unique(deg_all$gene[deg_all$status == "ok"])
+gs_t <- gs_assemble(gs_universe_t)
+kable_save(gs_t$provenance %>% dplyr::arrange(panel, set), "geneset_provenance_tcells",
+           caption = "T cells: gene sets, size, genes among the tested genes")
+
+gs_res_t_all <- gs_run(deg_all, gs_t$sets, GS_CONTRASTS_T, levels_use = GS_LEVELS_T)
+readr::write_csv(gs_res_t_all, file.path(path$tables, "geneset_tcells_all_rankings.csv"))
+
+gs_reg_t <- gs_registry_from_units(gs_units_t)
+gs_voom_t <- gs_run_voom(gs_reg_t, gs_t$sets)
+gs_reg_t_sev <- gs_registry_severity(gs_units_t, setdiff(GS_CONTRASTS_T, "xALD_vs_ctrl"))
+gs_voom_t_all <- dplyr::bind_rows(gs_voom_t, gs_run_voom(gs_reg_t_sev, gs_t$sets))
+invisible(gc())
+
+gs_res_t <- gs_finalise(gs_res_t_all, gs_t$provenance, gs_voom_t_all)
+gs_res_t$shift_robust <- suppressWarnings(gs_shift_robust(gs_res_t))
+readr::write_csv(gs_res_t, file.path(path$tables, "geneset_tcells.csv"))
+
+shift_t <- gs_shift_diagnostics(deg_all, GS_CONTRASTS_T, GS_LEVELS_T, gs_res_t_all)
+kable_save(shift_t, "geneset_tcells_shift_diagnostics", digits = 3,
+           caption = "T cells: global-shift diagnostics per family, gene and set level, with verdict")
+print(knitr::kable(dplyr::count(shift_t, comparison, verdict)))
+
+gs_res_t %>%
+  dplyr::filter(agree, panel != "control") %>%
+  dplyr::arrange(comparison, tissue, level, subset, padj_camera_vc_est, padj_fgsea) %>%
+  dplyr::select(comparison, tissue, level, subset, set, inference, tier, NES, dplyr::any_of(c(
+    "mean_logFC", "corr_camera_vc_est", "padj_camera_vc_est", "padj_fry", "fry_sig", "padj_camera_vc")),
+    padj_fgsea, padj_camera, padj_camera_sens, padj_matched,
+    dplyr::any_of(c("robust_matched", "robust_intensity", "NES_median_centred", "NES_intensity_resid")),
+    global_shift_flag, ieg_flag, leading_edge) %>%
+  kable_save("geneset_tcells_significant", digits = 3,
+             caption = "T cells: significant sets (donor-level call where available, else gene-level screen); robustness columns")
+
+gs_res_t %>% dplyr::filter(agree, panel != "control") %>%
+  dplyr::count(comparison, inference, global_shift_flag, dplyr::across(dplyr::any_of("robust_intensity"))) %>%
+  knitr::kable(caption = "Significant sets and the shift checks")
+```
+
+### 4.11.3 Figures
+
+```{r tcell-gs-figure, fig.width = 7.2, fig.height = 6}
+GS_FIG_GROUPS_T <- list(dx = "xALD_vs_ctrl", severity = DEG_SEV_REPORT)
+for (gn in names(GS_FIG_GROUPS_T)) {
+  sfx <- if (gn == "dx") "" else paste0("_", gn)
+  ttl <- if (gn == "dx") "X-ALD vs control" else "severity"
+  d <- gs_res_t %>% dplyr::filter(comparison %in% GS_FIG_GROUPS_T[[gn]])
+  if (!nrow(d)) next
+  dl <- d %>% dplyr::filter(level %in% c("all_T", "lineage"))
+  if (nrow(dl)) {
+    p_gs_t <- gs_plot_dots(dl, gs_t$provenance,
+      title = paste0("T-cell gene sets, all T and CD4/CD8, ", ttl, " (NES; ring = significant, column agree)"))
+    print(p_gs_t)
+    save_umap_fig(p_gs_t, paste0("geneset_tcells_dots_lineage", sfx), path$graphs_tcells,
+                  width_mm = FIG_WIDTH_MM[["double"]],
+                  height_mm = min(FIG_MAX_DEPTH_MM, round(3.2 * length(unique(dl$set)) + 45)))
+  }
+  for (ti in unique(d$tissue)) {
+    dc <- d %>% dplyr::filter(level == "celltype", tissue == ti)
+    if (!nrow(dc)) next
+    p <- gs_plot_dots(dc, gs_t$provenance, title = paste(ti, "T-cell subtypes: gene sets,", ttl))
+    print(p)
+    save_umap_fig(p, paste0("geneset_tcells_dots_celltype_", ti, sfx), path$graphs_tcells,
+                  width_mm = FIG_WIDTH_MM[["double"]],
+                  height_mm = min(FIG_MAX_DEPTH_MM, round(3.2 * length(unique(dc$set)) + 55)))
+  }
+}
+```
+
+### 4.11.4 Transcription-factor activity
+
+```{r tcell-tf, fig.width = 7.2, fig.height = 5}
+if (!exists("tf_net") || is.null(tf_net))
+  tf_net <- tryCatch(tf_get_network(), error = function(e) {
+    warning("TF network unavailable -- no T-cell TF tables: ", conditionMessage(e),
+            call. = FALSE); NULL })
+tf_res_t <- NULL
+if (!is.null(tf_net)) {
+  tf_res_t <- tf_run(deg_all, tf_net, GS_CONTRASTS_T, levels_use = c("all_T", "lineage"))
+  readr::write_csv(tf_res_t, file.path(path$tables, "tf_activity_tcells.csv"))
+  p_tf_t <- tf_plot_heatmap(tf_res_t, intersect(TF_OF_INTEREST, tf_res_t$tf),
+                            title = paste0("T-cell transcription-factor activity (",
+                                           attr(tf_net, "network") %||% "network", ", ulm)"))
+  print(p_tf_t)
+  save_umap_fig(p_tf_t, "tf_activity_tcells", path$graphs_tcells,
+                width_mm = FIG_WIDTH_MM[["onehalf"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(3.4 * length(TF_OF_INTEREST) + 40)))
+}
+```
+
+### 4.11.5 Per-donor set scores
+
+```{r tcell-gs-donor, fig.width = 7.2, fig.height = 6}
+gs_score_sets_t <- gs_t$sets[gs_t$provenance$set[gs_t$provenance$source != "regex over tested genes"]]
+gs_donor_t <- gs_donor_scores(t_cells_DEG, gs_score_sets_t, CELLTYPE_COL) %>% dplyr::left_join(cov_t, by = "donor")
+readr::write_csv(gs_donor_t, file.path(path$tables, "geneset_tcells_donor_scores.csv"))
+
+GS_DONOR_SHOW_T <- intersect(gs_current_names(c("SREBP2_TARGETS_CORE", "SREBF1_LIPOGENIC", "LXR_TARGETS",
+                               "VLCFA_PEROXISOME", "GC_RESPONSE_CANONICAL",
+                               "IEG_DISSOCIATION_STRESS")), names(gs_score_sets_t))
+p_donor_t <- gs_donor_t %>%
+  dplyr::filter(tissue == "CSF", set %in% GS_DONOR_SHOW_T, !is.na(sev_grp)) %>%
+  dplyr::mutate(set = factor(set, levels = GS_DONOR_SHOW_T),
+                hydrocortisone = ifelse(is.na(hydrocortisone), "NA", as.character(hydrocortisone))) %>%
+  ggplot2::ggplot(ggplot2::aes(sev_grp, score, colour = sev_grp)) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey85", linewidth = FIG_LINE_MM) +
+  ggplot2::geom_point(ggplot2::aes(shape = hydrocortisone), size = 1.2,
+                      position = ggplot2::position_jitter(width = 0.12, height = 0, seed = 1)) +
+  ggplot2::stat_summary(fun = stats::median, fun.min = stats::median, fun.max = stats::median,
+                        geom = "crossbar", width = 0.5, linewidth = FIG_LINE_MM, colour = "black") +
+  ggplot2::scale_colour_manual(values = SEV_GROUP3_COLS, guide = "none") +
+  ggplot2::scale_x_discrete(labels = SEV_GROUP3_LABELS) +
+  ggplot2::facet_grid(set ~ celltype) +
+  ggplot2::labs(x = NULL, y = "Per-donor set score (mean z)", shape = "Hydrocortisone",
+                title = "CSF T cells: per-donor set scores") +
+  gs_theme() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                 strip.text.y = ggplot2::element_text(angle = 0, hjust = 0))
+print(p_donor_t)
+save_umap_fig(p_donor_t, "geneset_tcells_donor_scores_CSF", path$graphs_tcells,
+              width_mm = FIG_WIDTH_MM[["double"]], height_mm = min(FIG_MAX_DEPTH_MM, 28 * length(GS_DONOR_SHOW_T) + 30))
+
+donor_assoc_t <- gs_donor_associations(gs_donor_t)
+readr::write_csv(donor_assoc_t, file.path(path$tables, "geneset_tcells_donor_associations.csv"))
+```
+
+### 4.11.6 Treatment confounding check
+
+```{r tcell-confound}
+gs_treatment_check(gs_res_t, gs_t, tf_res_t, donor_assoc_t, "tcells")
+```
+
+## 4.12 Leave-one-donor-out: DEG and gene sets
+
+```{r tcell-loo, cache = FALSE, error = FALSE}
+units_t <- if (exists("gs_units_t")) Filter(function(u) u$tissue %in% DEG_LOO_TISSUES, gs_units_t) else
+  deg_loo_units(t_cells_DEG, DEG_LOO_TISSUES, "all_T", CELLTYPE_COL, lineage_col = "lineage")
+loo_t   <- deg_loo_run(units_t, deg_all, "tcells")
+loo_gs_t <- gs_loo_voom(c(gs_reg_t, gs_reg_t_sev), gs_t$sets, gs_res_t)
+
+fam_t <- loo_t$families
+if (!is.null(fam_t)) {
+  if (!any(fam_t$status == "ok")) stop("LOO: no family could be fit")
+  stale <- dplyr::filter(fam_t, sig_match %in% FALSE)
+  if (nrow(stale))
+    stop("deg_all is stale for ", nrow(stale), " families: ",
+         paste(stale$tissue, stale$level, stale$subset, stale$comparison, sep = "/", collapse = "; "),
+         " -- rerun DEG before LOO")
+  readr::write_csv(fam_t, file.path(path$tables, "DEG_tcells_loo_families.csv"))
+}
+readr::write_csv(loo_t$genes, file.path(path$tables, "DEG_tcells_loo_genes.csv"))
+readr::write_csv(loo_t$folds, file.path(path$tables, "DEG_tcells_loo_folds.csv"))
+
+loo_sum_t <- deg_loo_summary(loo_t$genes)
+kable_save(loo_sum_t, "DEG_tcells_loo_summary", digits = 3,
+           caption = "T-cell DEG: share of significant genes that stay significant when one donor is removed")
+deg_all <- collect_deg_results(loo_annotate(deg_all, loo_t$genes, "gene"),
+                               csv_prefix = file.path(path$tables, "DEG_tcells"))
+
+gs_res_t <- loo_annotate(gs_res_t, loo_gs_t, "set")
+readr::write_csv(gs_res_t, file.path(path$tables, "geneset_tcells.csv"))
+kable_save(deg_loo_summary(loo_gs_t), "geneset_tcells_loo_summary", digits = 3,
+           caption = "T-cell gene sets: share of significant sets retained when one donor is removed")
+gs_res_t %>%
+  dplyr::filter(agree, panel != "control") %>%
+  dplyr::arrange(comparison, tissue, level, subset, padj_camera_vc_est) %>%
+  dplyr::select(comparison, tissue, level, subset, set, inference, tier, NES, padj_camera_vc_est, padj_fry,
+                global_shift_flag, ieg_flag, loo_frac_retained, loo_status, loo_lost_without, leading_edge) %>%
+  kable_save("geneset_tcells_significant", digits = 3,
+             caption = "T cells: significant sets with leave-one-donor-out")
+knitr::kable(loo_sum_t, caption = "T-cell DEG leave-one-donor-out (CSF and PBMC)")
+```
+
+## 4.13 T cells vs myeloid cells
+
+```{r tcell-vs-myeloid-gs}
+if (!exists("gs_res_mc")) {
+  f_mc <- file.path(path$tables, "geneset_myeloid.csv")
+  gs_res_mc <- if (file.exists(f_mc)) readr::read_csv(f_mc, show_col_types = FALSE) else NULL
+}
+if (!is.null(gs_res_mc)) {
+  pick <- function(r, lvl, tag) r %>%
+    dplyr::filter(level == lvl) %>%
+    dplyr::transmute(comparison, tissue, set, panel,
+                     !!paste0("NES_", tag) := NES,
+                     !!paste0("padj_", tag) := padj_fgsea,
+                     !!paste0("agree_", tag) := agree)
+  cmp_t_mc <- dplyr::full_join(pick(gs_res_mc, "all_myeloid", "myeloid"),
+                               pick(gs_res_t, "all_T", "tcells"),
+                               by = c("comparison", "tissue", "set", "panel")) %>%
+    dplyr::filter(!panel %in% "immune") %>%
+    dplyr::arrange(comparison, tissue, panel, set)
+  kable_save(cmp_t_mc, "geneset_tcells_vs_myeloid", digits = 3, caption = paste(
+    "Same gene sets in all T cells vs all myeloid cells (NES, fgsea padj, agree)."))
+} else message("myeloid gene-set results not found -- run Part 3 first")
+```
+
+# Supplement
+
+## S4.1 Detection-rate adjustment
+
+```{r tcell-gs-cdr}
+if (isTRUE(GS_ADJUST_CDR)) {
+  gs_reg_t_adj <- gs_registry_adjust(gs_reg_t)
+  gs_voom_t_adj <- gs_run_voom(gs_reg_t_adj, gs_t$sets)
+
+  kable_save(gs_corr_summary(gs_voom_t, gs_voom_t_adj), "geneset_tcells_cdr_correlation", digits = 3,
+             caption = "T cells, X-ALD vs control: camera's estimated within-set correlation and significant sets, without / with detection-rate covariate")
+
+  deg_t_reg <- gs_registry_deg(gs_reg_t)
+  deg_t_adj <- gs_registry_deg(gs_reg_t_adj)
+  conc_t <- gs_deg_concordance(deg_t_reg, deg_t_adj)
+  readr::write_csv(conc_t, file.path(path$tables, "DEG_tcells_cdr_concordance.csv"))
+  kable_save(conc_t %>% dplyr::arrange(tissue, level, subset), "DEG_tcells_cdr_concordance", digits = 3,
+             caption = "T cells, X-ALD vs control: DEGs without vs with detection-rate covariate (supplement)")
+
+  gs_res_t_adj_all <- gs_run(deg_t_adj, gs_t$sets, "xALD_vs_ctrl", levels_use = GS_LEVELS_T)
+  gs_res_t_adj <- gs_finalise(gs_res_t_adj_all, gs_t$provenance, gs_voom_t_adj)
+  readr::write_csv(gs_res_t_adj, file.path(path$tables, "geneset_tcells_cdr_adjusted.csv"))
+
+  cmp_t <- dplyr::full_join(
+    gs_res_t %>% dplyr::filter(comparison == "xALD_vs_ctrl", panel != "control") %>%
+      dplyr::select(dplyr::all_of(GS_KEYS), set, NES, padj_camera_vc_est, padj_fry, agree),
+    gs_res_t_adj %>% dplyr::filter(panel != "control") %>%
+      dplyr::select(dplyr::all_of(GS_KEYS), set, NES, padj_camera_vc_est, padj_fry, agree,
+                    dplyr::any_of(c("robust_matched", "robust_intensity")), leading_edge),
+    by = c(GS_KEYS, "set"), suffix = c("_unadj", "_adj")) %>%
+    dplyr::filter(agree_unadj %in% TRUE | agree_adj %in% TRUE)
+  readr::write_csv(cmp_t, file.path(path$tables, "geneset_tcells_cdr_comparison.csv"))
+  print(knitr::kable(dplyr::count(cmp_t, tissue, unadjusted = agree_unadj %in% TRUE, adjusted = agree_adj %in% TRUE),
+                     caption = "Significant sets without / with the detection-rate covariate"))
+  cmp_t %>% dplyr::filter(agree_adj %in% TRUE) %>%
+    dplyr::arrange(tissue, level, subset, padj_camera_vc_est_adj) %>%
+    dplyr::select(tissue, level, subset, set, NES_adj, padj_camera_vc_est_adj, padj_fry_adj,
+                  dplyr::any_of(c("robust_matched", "robust_intensity")), agree_unadj, leading_edge) %>%
+    kable_save("geneset_tcells_cdr_significant", digits = 3,
+               caption = "T cells, X-ALD vs control: significant sets with the detection-rate covariate")
+}
+```
+
+## S4.2 Calibration
+
+```{r tcell-gs-calibration}
+GS_CALIBRATE_T   <- TRUE
+GS_CALIB_N_MAX   <- 200
+GS_CALIB_FAMS_T  <- list(c("CSF", "all_T", "all"), c("PBMC", "all_T", "all"))
+calib_file <- file.path(path$objects, "gs_calibration_tcells.qs")
+if (isTRUE(GS_CALIBRATE_T)) {
+  calib_t <- if (file.exists(calib_file)) qs::qread(calib_file) else {
+    pick <- function(reg, f) Filter(function(e) e$tissue == f[1] && e$level == f[2] && e$subset == f[3], reg)
+    regs <- list(gs_reg_t, if (exists("gs_reg_t_adj")) gs_reg_t_adj)
+    out <- list()
+    for (f in GS_CALIB_FAMS_T) for (r in Filter(Negate(is.null), regs)) for (e in pick(r, f)) {
+      message("calibration: ", paste(f, collapse = " | "), " | ", if (is.null(e$adjusted)) "unadjusted" else "adjusted")
+      out[[length(out) + 1]] <- gs_calibrate_voom(e, gs_t$sets, n_max = GS_CALIB_N_MAX)
+    }
+    out <- Filter(Negate(is.null), out)
+    qs::qsave(out, calib_file)
+    out
+  }
+  calib_sum_t <- dplyr::bind_rows(lapply(calib_t, `[[`, "summary"))
+  kable_save(calib_sum_t, "geneset_tcells_calibration", digits = 3,
+             caption = "T cells: share of p < 0.05 under relabelled donors (non-control sets); calibrated test ~0.05, 'balanced' = relabelings mixing the true groups evenly")
+}
+```
+
+# Session info
+
+```{r session-info-04-tcells}
+sessionInfo()
+```

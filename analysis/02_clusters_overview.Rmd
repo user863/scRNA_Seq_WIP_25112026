@@ -1,0 +1,225 @@
+---
+title: "xALD single-cell atlas -- Part 2: Cluster identification and whole-object plots"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/02_clusters_overview.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+```
+
+# Part 2: Cluster Overview
+
+```{r knitr-setup-part2, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 12,
+  fig.height = 10,
+  dpi     = 150
+)
+```
+
+## 2.1 Configuration
+
+```{r config-part2}
+cfg <- list(
+  object_file = file.path(path$objects, "03_xALD_filtered_integrated.qs"),
+  label_col   = "celltypes",
+  assay       = "RNA",
+  reduction   = "umap_harmony",
+  umap_ncol   = 3,
+  pt_size     = 0.25
+)
+expr_cols <- c("#f5e642", "#FF0000")
+```
+
+## 2.2 Load
+
+```{r load-object-part2}
+xALD_filtered <- add_severity(qread(cfg$object_file))
+xALD_filtered <- lapply(xALD_filtered, function(so) {
+  DefaultAssay(so) <- cfg$assay
+  lab <- as.character(so@meta.data[[cfg$label_col]])
+  lab[lab %in% c("", "NA") | grepl("^[0-9]+$", lab)] <- NA
+  so$celltype_lab <- lab
+  so <- so[, !is.na(so$celltype_lab)]
+  so$celltype_lab <- factor(so$celltype_lab, levels = sort(unique(so$celltype_lab)))
+  Idents(so) <- "celltype_lab"
+  so
+})
+imap_dfr(xALD_filtered, function(so, comp)
+  setNames(as.data.frame(table(so$celltype_lab)), c("celltype", "n_cells")) %>%
+    mutate(compartment = comp, .before = 1)) %>%
+  kable(caption = "Cells per labelled cluster")
+```
+
+## 2.3 UMAP
+
+```{r umap-panels-all}
+fig_all_umap <- umap_compartment_figure(xALD_filtered, label_col = "celltype_lab",
+                                        stem = "umap_allCells_panels",
+                                        level_title = "all cells",
+                                        dir = path$umap_figures)
+print(fig_all_umap$figure)
+store_figure_panels("allCells", "umap", fig_all_umap)
+```
+
+## 2.4 Marker dot plots
+
+```{r dot-panels-all}
+dot_markers_all <- list(
+  "Myeloid Cells"       = c("CST3", "CSF1R", "MNDA", "LYZ"),
+  "pDC"                 = c("CLEC4C", "PTCRA", "LILRA4", "SCT", "LRRC26"),
+  "CD4+T-Cells"         = c("CD40LG", "LEF1", "MAL"),
+  "CD8+T-Cells"         = c("CD8B", "CD8A", "TRDC"),
+  "NK Cells"            = c("NCR1", "SH2D1B", "KLRF1", "KLRC1"),
+  "B-Cells"             = c("IGKC", "IGHM", "MS4A1", "CD79B", "CD79A"),
+  "Plasmablasts"        = c("MZB1"),
+  "Proliferating Cells" = c("MKI67", "TOP2A"),
+  "HSPCs"               = c("CD34"))
+
+dots_all <- dot_compartment_figure(xALD_filtered, dot_markers_all, "celltype_lab",
+                                   stem = "dot_allCells", umap_fig = fig_all_umap,
+                                   dir = path$umap_figures)
+for (d in dots_all) print(d$figure)
+store_figure_panels("allCells", "dots", dots_all)
+```
+
+## 2.5 Marker UMAPs
+
+```{r marker-umaps}
+gene_panels <- list(
+  "B-Cells"       = c("CD19", "CD79A", "PAX5"),
+  "NK Cells"      = c("NCR1", "SH2D1B", "KLRF1"),
+  "CD8+T-Cells"   = c("CD8A", "CD8B", "GZMK"),
+  "CD4+T-Cells"   = c("CD40LG", "TESPA1", "MAL"),
+  "pDC"           = c("CLEC4C", "LILRA4", "SCT"),
+  "Myeloid Cells" = c("CSF1R", "MNDA", "LYZ"))
+
+marker_feature_plot <- function(so, genes) {
+  n <- min(cfg$umap_ncol, length(genes))
+  p <- if (requireNamespace("scCustomize", quietly = TRUE))
+    scCustomize::FeaturePlot_scCustom(so, features = genes, reduction = cfg$reduction,
+                                      colors_use = expr_cols, na_color = "grey85", order = TRUE,
+                                      pt.size = cfg$pt_size, num_columns = n)
+  else
+    Seurat::FeaturePlot(so, features = genes, reduction = cfg$reduction, order = TRUE,
+                        pt.size = cfg$pt_size, ncol = n)
+  p & theme_umap_panel()
+}
+
+for (comp in names(xALD_filtered)) {
+  so <- xALD_filtered[[comp]]
+  for (ct in names(gene_panels)) {
+    genes <- intersect(gene_panels[[ct]], rownames(so))
+    if (!length(genes)) next
+    p <- marker_feature_plot(so, genes) +
+      patchwork::plot_annotation(title = paste0(comp, " - ", ct))
+    print(p)
+    ggsave(file.path(path$marker_umap, paste0("umap_panel_markers_", comp, "_", sanitize(ct), ".png")),
+           p, width = 4 * min(cfg$umap_ncol, length(genes)),
+           height = 3.6 * ceiling(length(genes) / cfg$umap_ncol), dpi = 300, limitsize = FALSE)
+  }
+}
+```
+
+## 2.6 Differential abundance
+
+```{r coarse-ab-params}
+par_ab_coarse <- list(
+  label_col       = "celltype_lab",
+  donor_col       = "patient_ID",
+  group_col       = "diagnosis",
+  compartment_col = "compartment",
+  strat_col       = "severity_active",
+  ref_group       = "control",
+  min_cells       = 5,
+  min_samples     = 0.5,
+  fdr             = 0.05
+)
+meta_all_coarse <- ab_get_meta(xALD_filtered, par_ab_coarse$compartment_col)
+```
+
+### 2.6.1 X-ALD vs control
+
+```{r coarse-ab-fit, fig.width = 11, fig.height = 5}
+ab_coarse <- list()
+for (comp in names(xALD_filtered)) {
+  ab <- tryCatch(
+    build_abundance_inputs(
+      meta_all_coarse,
+      compartment_col = par_ab_coarse$compartment_col, focus = comp,
+      donor_col = par_ab_coarse$donor_col, group_col = par_ab_coarse$group_col,
+      label_col = par_ab_coarse$label_col, strat_col = par_ab_coarse$strat_col,
+      ref_group = par_ab_coarse$ref_group,
+      min_cells = par_ab_coarse$min_cells, min_samples = par_ab_coarse$min_samples),
+    error = function(e) { message(comp, ": ", conditionMessage(e)); NULL })
+  if (is.null(ab)) next
+
+  design <- model.matrix(~ group, data = ab$sinfo)
+  colnames(design) <- make.names(colnames(design))
+  coef <- setdiff(colnames(design), "X.Intercept.")[1]
+  if (is.na(coef)) next
+
+  res <- tryCatch(fit_ab(ab$mat, ab$sinfo, ab$totals, design, coef = coef, fdr = par_ab_coarse$fdr),
+                  error = function(e) { message(comp, " fit: ", conditionMessage(e)); NULL })
+  if (is.null(res)) next
+  res <- res %>% dplyr::arrange(FDR) %>% dplyr::mutate(compartment = comp, .before = 1)
+
+  print(plot_ab_figure(
+    ab$long, res, ab$totals, pal = umap_palette_for(fig_all_umap, comp, ab$long$celltype),
+    title_a = paste("Per-donor composition —", comp),
+    title_b_prefix = "X-ALD vs control",
+    y_lab = paste("proportion of all labelled", comp, "cells"),
+    fdr = par_ab_coarse$fdr,
+    out_file = file.path(path$abundance, paste0("abundance_coarse_edgeR_", sanitize(comp), ".png"))))
+
+  readr::write_csv(res, file.path(path$tables, paste0("abundance_coarse_", sanitize(comp), ".csv")))
+  ab_coarse[[comp]] <- list(inputs = ab, res = res)
+}
+
+store_figure_panels("allCells", "abundance", abundance_figure_panels(
+  ab_coarse, umap_fig = fig_all_umap, ref_group = par_ab_coarse$ref_group,
+  contrast = "X-ALD vs control", fdr = par_ab_coarse$fdr,
+  y_lab = "proportion of labelled cells"))
+```
+
+### 2.6.2 Compositional check
+
+```{r coarse-ab-compositional}
+comp_coarse <- dplyr::bind_rows(lapply(names(ab_coarse), function(comp)
+  ab_compositional(ab_coarse[[comp]]$inputs, ab_coarse[[comp]]$res) %>% dplyr::mutate(compartment = comp, .before = 1)))
+readr::write_csv(comp_coarse, file.path(path$tables, "abundance_coarse_compositional.csv"))
+knitr::kable(comp_coarse, digits = 3, caption = "All cells, X-ALD vs control: share vs compositional tests")
+```
+
+### 2.6.3 Stage 3 vs stages 1-2, within X-ALD
+
+```{r coarse-ab-sev, fig.width = 11, fig.height = 5}
+ab_coarse_sev <- run_ab_sev(meta_all_coarse, par_ab_coarse, names(xALD_filtered),
+                            tag = "coarse", fig = fig_all_umap)
+```
+
+### 2.6.4 Composition by severity stage
+
+```{r coarse-ab-by-severity, fig.width = 9, fig.height = 6}
+plot_ab_by_severity(meta_all_coarse, "celltype_lab", title = "All cells by severity stage", umap_fig = fig_all_umap,
+                    out_file = file.path(path$abundance, "abundance_by_severity_coarse.png"))
+```
+
+# Session info
+
+```{r session-info-02-clusters-overview}
+sessionInfo()
+```

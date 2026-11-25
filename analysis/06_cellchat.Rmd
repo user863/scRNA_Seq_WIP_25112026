@@ -1,0 +1,1761 @@
+---
+title: "xALD single-cell atlas -- Part 6: Cell-cell communication (CellChat)"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/06_cellchat.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8, dpi = 150)
+```
+
+# Part 6: Cell-cell communication (CellChat)
+
+## 6.1 Configuration and data
+
+```{r cc-config}
+ensure_dir <- function(d) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = TRUE)
+  if (!dir.exists(d)) stop("Could not create directory: ", d, call. = FALSE)
+  if (file.access(d, mode = 2) != 0) stop("Directory not writable: ", d, call. = FALSE)
+  invisible(d)
+}
+cc_dir <- ensure_dir(path$graphs_cellchat_contrasts)
+
+IDENTS_COL  <- "celltypes"
+DONOR_COL   <- "orig.ident"
+STEROID_COL <- "Hydrocortisone"
+GRP_COLS    <- c(ref = "grey60", test = "#B2182B")
+
+CC_POPSIZE   <- FALSE
+CC_MIN_CELLS <- DEG_MIN_CELLS
+CC_NBOOT     <- 100
+CC_MEAN_TYPE <- "truncatedMean"
+CC_TRIM      <- 0.1
+SIG_THRESH   <- 0.05
+PADJ_METHOD  <- "BH"
+DEG_THRESH_FC <- 0.05
+DEG_LFC       <- 0.05
+CC_PB_COMPARISON <- c(dx = "xALD_vs_ctrl", sev = "sev3_vs_sev12")
+
+xALD_obj <- qread(file.path(path$objects, "03_xALD_filtered_integrated.qs"))
+seu <- add_severity(xALD_obj$CSF)
+
+make_contrast <- function(id, col, ref, test, ref_label, test_label,
+                          filter = function(md) rep(TRUE, nrow(md))) {
+  list(id = id, col = col, ref = ref, test = test,
+       ref_label = ref_label, test_label = test_label,
+       label = paste(test_label, "vs.", ref_label),
+       delta = paste(test_label, "−", ref_label),
+       filter = filter, note = NULL)
+}
+
+contrast_cells <- function(cn, md) {
+  keep <- (cn$filter(md) %in% TRUE) & (md[[cn$col]] %in% c(cn$ref, cn$test))
+  rownames(md)[keep]
+}
+
+CONTRASTS <- list(
+  dx = make_contrast(
+    "dx", "diagnosis", ref = "control", test = "X-ALD",
+    ref_label = "Control", test_label = "X-ALD"),
+  sev = make_contrast(
+    "sev", "severity_active", ref = "lessactive", test = "active",
+    ref_label = "X-ALD stage 1-2", test_label = "X-ALD stage 3",
+    filter = function(md) md$diagnosis == "X-ALD")
+)
+
+steroid_note <- function(cn, md, col = STEROID_COL, donor_col = DONOR_COL) {
+  if (!col %in% colnames(md)) {
+    warning("Column '", col, "' not found -- steroid exposure not checked.")
+    return(paste0("Hydrocortisone exposure not assessed (column '", col,
+                  "' not found)."))
+  }
+  cells <- contrast_cells(cn, md)
+  d <- unique(data.frame(donor = as.character(md[cells, donor_col]),
+                         grp   = as.character(md[cells, cn$col]),
+                         gc    = as.character(md[cells, col])))
+  mixed <- unique(d$donor[duplicated(d$donor)])
+  if (length(mixed)) {
+    warning(cn$id, ": donor(s) with more than one ", col, "/group value: ",
+            paste(mixed, collapse = ", "))
+  }
+  arms <- c(cn$ref, cn$test); arm_lab <- c(cn$ref_label, cn$test_label)
+  per_arm <- vapply(seq_along(arms), function(i) {
+    v <- d$gc[d$grp == arms[i]]
+    tb <- table(ifelse(is.na(v), "NA", v))
+    paste0(arm_lab[i], ": ", paste(names(tb), tb, collapse = ", "))
+  }, character(1))
+  txt <- paste0("Hydrocortisone per donor: ",
+                paste(per_arm, collapse = "; "), ".")
+
+  yes <- c("yes", "ja", "true", "1", "y", "+")
+  no  <- c("no", "nein", "false", "0", "n", "-")
+  lv  <- tolower(d$gc)
+  if (!all(lv %in% c(yes, no))) {
+    return(paste(txt, "Exposure not unambiguously coded;",
+                 "confounding with hydrocortisone requires manual review."))
+  }
+  frac <- vapply(arms, function(a) mean(lv[d$grp == a] %in% yes), numeric(1))
+  if (isTRUE(all.equal(frac[[1]], frac[[2]]))) {
+    return(paste(txt, "Exposure equally distributed between groups."))
+  }
+  if (all(frac %in% c(0, 1))) {
+    return(paste(txt, "Group and hydrocortisone exposure are completely",
+                 "confounded; differences cannot be attributed to disease/inflammation",
+                 "versus steroid exposure."))
+  }
+  paste(txt, "Exposure differs between groups (partial",
+        "confounding); differences may include steroid effects.")
+}
+
+CONTRASTS <- lapply(CONTRASTS, function(cn) { cn$note <- steroid_note(cn, seu@meta.data); cn })
+purrr::map_dfr(CONTRASTS, ~ tibble::tibble(
+  ID = .x$id, Contrast = .x$label, `Δ` = .x$delta, Note = .x$note)) %>%
+  knitr::kable()
+
+DB_MAIN_CATEGORIES <- c("Secreted Signaling", "Cell-Cell Contact", "Non-protein Signaling")
+DB_MAIN <- local({
+  db <- CellChatDB.human
+  missing <- setdiff(DB_MAIN_CATEGORIES, unique(db$interaction$annotation))
+  if (length(missing)) stop("CellChatDB has no category named: ", toString(missing), call. = FALSE)
+  db$interaction <- db$interaction[db$interaction$annotation %in% DB_MAIN_CATEGORIES, , drop = FALSE]
+  stopifnot(nrow(db$interaction) > 0, !is.null(rownames(db$complex)))
+  db
+})
+DB_MAIN_TAG <- "main_np"
+```
+
+## 6.2 Core functions
+
+```{r cc-core}
+cc_run_tag <- function(db_tag, population.size, nboot) {
+  paste0(db_tag, "_nb", nboot, if (isTRUE(population.size)) "_popsize" else "")
+}
+
+cc_signature <- function(cn, db_tag, population.size, min_cells, nboot,
+                         mean_type = CC_MEAN_TYPE, trim = CC_TRIM,
+                         thresh_fc = DEG_THRESH_FC) {
+  list(id = cn$id, col = cn$col, ref = cn$ref, test = cn$test,
+       filter = paste(deparse(cn$filter), collapse = "\n"),
+       db_tag = db_tag, population.size = isTRUE(population.size),
+       min_cells = as.integer(min_cells), nboot = as.integer(nboot),
+       mean_type = mean_type, trim = trim, thresh_fc = thresh_fc)
+}
+
+cc_result_ok <- function(res, sig) is.list(res) && is.list(res$cn) && identical(res$sig, sig)
+
+resolve_genes <- function(name, db) {
+  cx <- db$complex
+  if (is.null(cx) || !name %in% rownames(cx)) return(name)
+  v <- as.character(unlist(cx[name, grep("^subunit", colnames(cx)), drop = TRUE]))
+  unique(v[!is.na(v) & nzchar(v)])
+}
+
+perm_p_unbiased <- function(p, nboot) {
+  if (is.null(nboot) || !is.finite(nboot) || nboot <= 0) return(p)
+  (round(p * nboot) + 1) / (nboot + 1)
+}
+
+cc_nboot_of <- function(x, default = CC_NBOOT) {
+  nb <- x$nboot
+  if (is.null(nb) || !is.finite(nb) || nb <= 0) default else nb
+}
+
+padj_arm <- function(p, prob, method = PADJ_METHOD) {
+  out <- rep(NA_real_, length(p))
+  i <- which(!is.na(p) & !is.na(prob) & prob > 0)
+  if (length(i)) out[i] <- p.adjust(p[i], method = method)
+  out
+}
+
+prep_matrix <- function(seu_obj) {
+  layers <- function() SeuratObject::Layers(seu_obj[["RNA"]])
+  if (!any(grepl("^data", layers()))) seu_obj <- Seurat::NormalizeData(seu_obj)
+  if (!"data" %in% layers()) {
+    seu_obj[["RNA"]] <- SeuratObject::JoinLayers(seu_obj[["RNA"]])
+  }
+  m <- SeuratObject::LayerData(seu_obj, assay = "RNA", layer = "data")
+  stopifnot(nrow(m) > 0, max(m[, seq_len(min(50, ncol(m)))]) < 50)
+  m
+}
+
+run_cc <- function(cells, db, dat, meta_df, idents_col = IDENTS_COL,
+                   population.size = FALSE, nboot = CC_NBOOT) {
+  stopifnot(is.character(cells), length(cells) > 0,
+            all(cells %in% colnames(dat)))
+  meta <- data.frame(
+    labels  = droplevels(factor(meta_df[cells, idents_col])),
+    samples = droplevels(factor(meta_df[cells, DONOR_COL])),
+    row.names = cells)
+  cc <- createCellChat(object = dat[, cells, drop = FALSE],
+                       meta = meta, group.by = "labels")
+  cc@DB <- db
+  stopifnot(!is.null(cc@DB$complex), !is.null(rownames(cc@DB$complex)))
+  cc <- subsetData(cc)
+  stopifnot(!is.null(cc), nrow(cc@data.signaling) > 0)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc, type = CC_MEAN_TYPE, trim = CC_TRIM,
+                          population.size = population.size, nboot = nboot)
+  cc <- filterCommunication(cc, min.cells = 10)
+  cc <- computeCommunProbPathway(cc)
+  cc <- aggregateNet(cc)
+  netAnalysis_computeCentrality(cc)
+}
+
+safe_comm <- function(cc, ...) {
+  res <- tryCatch(subsetCommunication(cc, ...), error = function(e) {
+    message("subsetCommunication() failed: ", conditionMessage(e)); NULL
+  })
+  if (is.null(res)) return(tibble::tibble())
+  if (is.list(res) && !is.data.frame(res)) {
+    res <- res[!vapply(res, function(z) is.null(z) || nrow(z) == 0, logical(1))]
+    if (!length(res)) return(tibble::tibble())
+    res <- dplyr::bind_rows(res, .id = "datasets")
+  }
+  tibble::as_tibble(res)
+}
+
+build_contrast <- function(cn, seu_full, db = DB_MAIN, db_tag = DB_MAIN_TAG,
+                           population.size = CC_POPSIZE, force = FALSE,
+                           min_cells = CC_MIN_CELLS, nboot = CC_NBOOT) {
+  run_tag <- cc_run_tag(db_tag, population.size, nboot)
+  sig     <- cc_signature(cn, db_tag, population.size, min_cells, nboot)
+  f <- file.path(cc_dir, sprintf("cc_%s_%s.rds", cn$id, run_tag))
+
+  finalize <- function(res) {
+    res$cn <- cn; res$sig <- sig; res$run_tag <- run_tag; res$db_tag <- db_tag
+    res$nboot <- nboot
+    res
+  }
+
+  if (file.exists(f) && !force) {
+    cached <- tryCatch(readRDS(f), error = function(e) NULL)
+    if (cc_result_ok(cached, sig)) {
+      message("loaded: ", f); return(finalize(cached))
+    }
+    message("Cache at ", f, " does not match the current contrast/settings -- rebuilding.")
+  }
+
+  md_all <- seu_full@meta.data
+  stopifnot(cn$col %in% colnames(md_all), IDENTS_COL %in% colnames(md_all),
+            is.function(cn$filter))
+
+  cells_all <- contrast_cells(cn, md_all)
+  md <- md_all[cells_all, , drop = FALSE]
+  md[[cn$col]] <- factor(as.character(md[[cn$col]]), levels = c(cn$ref, cn$test))
+  stopifnot(all(table(md[[cn$col]]) > 0))
+
+  ct_counts  <- table(as.character(md[[IDENTS_COL]]), md[[cn$col]])
+  keep_ct    <- rownames(ct_counts)[apply(ct_counts >= min_cells, 1, all)]
+  dropped_ct <- setdiff(rownames(ct_counts), keep_ct)
+  if (length(dropped_ct)) {
+    message(cn$label, ": dropping cell type(s) below min_cells=", min_cells,
+            " in at least one arm: ", paste(dropped_ct, collapse = ", "))
+  }
+  cells_all <- cells_all[as.character(md[[IDENTS_COL]]) %in% keep_ct]
+  stopifnot(length(cells_all) > 0)
+  md <- md[cells_all, , drop = FALSE]
+
+  dat  <- prep_matrix(base::subset(seu_full, cells = cells_all))[, cells_all, drop = FALSE]
+  grps <- split(cells_all, md[[cn$col]])
+  message(cn$label, " — ", paste(names(grps), lengths(grps), collapse = " / "),
+          " | nboot = ", nboot)
+  stopifnot(identical(names(grps), c(cn$ref, cn$test)),
+            all(lengths(grps) >= 50))
+
+  cl <- lapply(grps, run_cc, db = db, dat = dat, meta_df = md,
+               population.size = population.size, nboot = nboot)
+
+  lv <- lapply(cl, function(o) levels(o@idents))
+  if (!all(vapply(lv, identical, logical(1), lv[[1]]))) {
+    all_ct <- unique(unlist(lv))
+    cl <- lapply(cl, liftCellChat, group.new = all_ct)
+  }
+  merged <- mergeCellChat(cl, add.names = names(cl))
+
+  merged <- identifyOverExpressedGenes(
+    merged, group.dataset = "datasets", pos.dataset = cn$test,
+    features.name = cn$test, only.pos = FALSE,
+    thresh.pc = 0.1, thresh.fc = DEG_THRESH_FC, thresh.p = 0.05)
+  deg <- netMappingDEG(merged, features.name = cn$test)
+
+  ct  <- levels(cl[[1]]@idents)
+  res <- list(
+    list = cl, merged = merged, deg = deg, ct = ct,
+    pal = setNames(scales::hue_pal()(length(ct)), ct),
+    meta = md, dropped_ct = dropped_ct,
+    population.size = isTRUE(population.size), min_cells = min_cells)
+  res <- finalize(res)
+  tryCatch({
+    ensure_dir(dirname(f)); saveRDS(res, f); message("saved: ", f)
+  }, error = function(e) {
+    warning("Could not save cache ", f, ": ", conditionMessage(e),
+            " -- result kept in memory only.", call. = FALSE)
+  })
+  res
+}
+
+cc_pseudobulk <- function(seu_full = seu, celltype_col = IDENTS_COL,
+                          donor_col = DONOR_COL,
+                          min_cells = DEG_MIN_CELLS,
+                          min_cells_per_sample = DEG_MIN_CELLS_PER_SAMPLE) {
+  cts <- sort(unique(as.character(seu_full@meta.data[[celltype_col]])))
+  cts <- cts[!is.na(cts)]
+  out <- lapply(cts, function(ct) {
+    keep <- seu_full@meta.data[[celltype_col]] == ct
+    so_sub <- tryCatch(subset_cells(seu_full, keep, what = paste("celltype ==", ct)),
+                       error = function(e) NULL)
+    if (is.null(so_sub) || ncol(so_sub) < min_cells) {
+      message("pseudobulk: skipping ", ct, " (too few cells)"); return(NULL)
+    }
+    res <- tryCatch(
+      run_all_contrasts(so_sub, donor_col = donor_col,
+                        min_cells_per_sample = min_cells_per_sample),
+      error = function(e) { message("pseudobulk ", ct, ": ", conditionMessage(e)); NULL })
+    if (is.null(res)) return(NULL)
+    dplyr::bind_rows(lapply(names(res), function(nm)
+      tidy_deg(res[[nm]], .tissue = "CSF", .level = "celltype",
+               .subset = ct, .comparison = nm)))
+  })
+  dplyr::bind_rows(out)
+}
+
+cc_pb_or_empty <- function() {
+  if (exists("CC_PB", envir = globalenv(), inherits = TRUE)) {
+    pb <- get("CC_PB", envir = globalenv())
+    if (is.data.frame(pb)) return(pb)
+  }
+  tibble::tibble()
+}
+
+pb_lookup <- function(nm_vec, ct_vec, pb, db, comparison) {
+  n <- length(nm_vec)
+  empty <- data.frame(pb_padj = rep(NA_real_, n), pb_log2FC = rep(NA_real_, n),
+                      pb_missing = rep(NA_integer_, n))
+  if (is.null(pb) || !nrow(pb) || !comparison %in% pb$comparison) return(empty)
+  pbc <- pb[pb$comparison == comparison & pb$status == "ok" & !is.na(pb$padj), ,
+            drop = FALSE]
+  if (!nrow(pbc)) return(empty)
+  k        <- paste(pbc$subset, pbc$gene, sep = "\r")
+  padj_map <- setNames(pbc$padj,   k)
+  lfc_map  <- setNames(pbc$log2FC, k)
+
+  u <- unique(data.frame(nm = as.character(nm_vec), ct = as.character(ct_vec),
+                         stringsAsFactors = FALSE))
+  vals <- t(vapply(seq_len(nrow(u)), function(i) {
+    g  <- resolve_genes(u$nm[i], db)
+    kk <- paste(u$ct[i], g, sep = "\r")
+    pj <- unname(padj_map[kk]); lf <- unname(lfc_map[kk])
+    if (all(is.na(pj))) return(c(NA_real_, NA_real_, length(g)))
+    if (anyNA(pj))      return(c(NA_real_, NA_real_, sum(is.na(pj))))
+    c(max(pj), lf[which.max(abs(lf))], 0)
+  }, numeric(3)))
+  u$pb_padj <- vals[, 1]; u$pb_log2FC <- vals[, 2]; u$pb_missing <- vals[, 3]
+  i <- match(paste(nm_vec, ct_vec, sep = "\r"), paste(u$nm, u$ct, sep = "\r"))
+  u[i, c("pb_padj", "pb_log2FC", "pb_missing"), drop = FALSE]
+}
+```
+
+## 6.3 Build or load contrasts
+
+```{r cc-build, message=TRUE}
+cc_new_file <- file.path(path$objects, sprintf("cellchat_contrasts_%s.qs",
+                                               cc_run_tag(DB_MAIN_TAG, CC_POPSIZE, CC_NBOOT)))
+cc_new_force_recompute <- FALSE
+
+cc_cache_valid <- function(cc, contrasts, db_tag = DB_MAIN_TAG,
+                           population.size = CC_POPSIZE, min_cells = CC_MIN_CELLS,
+                           nboot = CC_NBOOT) {
+  is.list(cc) && setequal(names(cc), names(contrasts)) &&
+    all(vapply(names(contrasts), function(nm) {
+      cc_result_ok(cc[[nm]],
+                   cc_signature(contrasts[[nm]], db_tag, population.size,
+                                min_cells, nboot))
+    }, logical(1)))
+}
+
+CC <- if (file.exists(cc_new_file) && !cc_new_force_recompute) qread(cc_new_file) else NULL
+if (is.null(CC) || !cc_cache_valid(CC, CONTRASTS)) {
+  CC <- lapply(CONTRASTS, build_contrast, seu_full = seu, force = cc_new_force_recompute)
+  names(CC) <- names(CONTRASTS)
+  tryCatch(qsave(CC, cc_new_file),
+           error = function(e) warning("Could not save ", cc_new_file, ": ", conditionMessage(e), call. = FALSE))
+}
+for (nm in names(CC)) {
+  CC[[nm]]$cn      <- CONTRASTS[[nm]]
+  CC[[nm]]$run_tag <- cc_run_tag(DB_MAIN_TAG, CC_POPSIZE, CC_NBOOT)
+}
+
+cc_pb_sig <- function() list(
+  min_count            = DEG_MIN_COUNT,
+  min_cells            = DEG_MIN_CELLS,
+  min_cells_per_sample = DEG_MIN_CELLS_PER_SAMPLE,
+  min_donors_per_group = DEG_MIN_DONORS_PER_GROUP,
+  shrink               = DEG_SHRINK,
+  drop_classes         = paste(sort(DEG_DROP_CLASSES), collapse = ","))
+
+cc_pb_file <- file.path(path$objects, "cellchat_pseudobulk_celltypes.qs")
+CC_PB <- local({
+  cached <- if (file.exists(cc_pb_file) && !cc_new_force_recompute)
+    tryCatch(qread(cc_pb_file), error = function(e) NULL) else NULL
+  if (!is.null(cached) && identical(attr(cached, "deg_sig"), cc_pb_sig()) &&
+      all(CC_PB_COMPARISON %in% cached$comparison)) return(cached)
+  pb <- cc_pseudobulk(seu)
+  attr(pb, "deg_sig") <- cc_pb_sig()
+  tryCatch(qsave(pb, cc_pb_file), error = function(e) warning("Could not save ", cc_pb_file, call. = FALSE))
+  pb
+})
+
+purrr::imap_dfr(CC, function(x, nm) {
+  comm <- safe_comm(x$merged)
+  n_arm <- function(g) if (nrow(comm)) sum(comm$datasets == g) else 0L
+  tibble::tibble(
+    ID = nm, Contrast = x$cn$label,
+    `Cells (ref)`  = sum(x$meta[[x$cn$col]] == x$cn$ref),
+    `Cells (test)` = sum(x$meta[[x$cn$col]] == x$cn$test),
+    Celltypes = length(x$ct), nboot = x$nboot,
+    `Dropped (< min_cells)` = paste(x$dropped_ct, collapse = ", "),
+    `LR pairs (raw p < 0.05)` = if (nrow(comm)) dplyr::n_distinct(comm$interaction_name) else 0L,
+    `Edges sig. (ref)`  = n_arm(x$cn$ref),
+    `Edges sig. (test)` = n_arm(x$cn$test))
+}) %>% knitr::kable()
+```
+
+## 6.4 Figure functions
+
+```{r cc-figs}
+out_dir_for <- function(x, sub = NULL) {
+  d <- file.path(cc_dir, x$run_tag, x$cn$id)
+  if (!is.null(sub) && nzchar(sub)) d <- file.path(d, sub)
+  ensure_dir(d)
+}
+
+out_file <- function(x, stem, sub = NULL) {
+  file.path(out_dir_for(x, sub), paste0(x$cn$id, "_", stem))
+}
+
+cap       <- function(x, txt) paste(c(txt, x$cn$note), collapse = " ")
+wrap_txt  <- function(txt, width = 130) paste(strwrap(txt, width), collapse = "\n")
+grp_label <- function(x, g) c(x$cn$ref_label, x$cn$test_label)[match(g, c(x$cn$ref, x$cn$test))]
+grp_cols  <- function(x) setNames(unname(GRP_COLS[c("ref", "test")]), c(x$cn$ref, x$cn$test))
+cap_theme <- ggplot2::theme(plot.caption = ggplot2::element_text(size = 7, colour = "grey35", hjust = 0))
+
+lr_caption <- function() paste0(
+  sprintf("Significance per group: permutation p < %s, uncorrected (CellChat convention); nboot = %s. ",
+          format(SIG_THRESH), format(CC_NBOOT)),
+  "padj_* reported, not applied. sig_in is descriptive (Gelman & Stern 2006); Δ prob is an effect size.")
+deg_caption <- function() sprintf(paste(
+  "DEG selection as in Jin et al. 2025, Procedure 2, Step 12B: identifyOverExpressedGenes(thresh.fc = %s)",
+  "-> netMappingDEG() -> selection by dataset and ligand |logFC| >= %s."), format(DEG_THRESH_FC), format(DEG_LFC))
+protocol_caption <- function() sprintf(paste(
+  "CellChat v2 (Jin et al. 2025): type = '%s', trim = %s, min.cells = 10, thresh = %s, nboot = %s,",
+  "no multiple-testing correction."), CC_MEAN_TYPE, format(CC_TRIM), format(SIG_THRESH), format(CC_NBOOT))
+
+show_png <- function(f, draw, width, height, res = 300) {
+  png(f, width = width, height = height, units = "in", res = res)
+  tryCatch(draw(), finally = dev.off())
+  draw()
+  invisible(f)
+}
+
+fig_overview <- function(x, sub = "01_networks", chord = TRUE) {
+  files <- character(0)
+
+  for (measure in c("count", "weight")) {
+    wmax <- tryCatch(getMaxWeight(x$list, attribute = c("idents", measure)),
+                     error = function(e) NULL)
+    lab <- if (measure == "count") "Number of interactions" else "Interaction strength"
+    f <- out_file(x, sprintf("overview_circle_%s.png", measure), sub)
+    ok <- tryCatch({
+      show_png(f, function() {
+        op <- par(mfrow = c(1, length(x$list)), xpd = TRUE); on.exit(par(op))
+        for (i in seq_along(x$list)) {
+          netVisual_circle(x$list[[i]]@net[[measure]], weight.scale = TRUE,
+                           color.use = x$pal,
+                           edge.weight.max = if (is.null(wmax)) NULL else wmax[2],
+                           edge.width.max = 12,
+                           title.name = sprintf("%s — %s", lab,
+                                                grp_label(x, names(x$list)[i])))
+        }
+      }, width = 5.5 * length(x$list), height = 5.5)
+      TRUE
+    }, error = function(e) {
+      message("  overview circle ", measure, ": ", conditionMessage(e)); FALSE })
+    if (ok) files <- c(files, f)
+  }
+
+  if (chord) {
+    f <- out_file(x, "overview_chord_weight.png", sub)
+    ok <- tryCatch({
+      show_png(f, function() {
+        op <- par(mfrow = c(1, length(x$list)), xpd = TRUE); on.exit(par(op))
+        for (i in seq_along(x$list)) {
+          netVisual_chord_cell(x$list[[i]], net = x$list[[i]]@net$weight,
+                               color.use = x$pal, lab.cex = 0.7,
+                               title.name = sprintf("Total interaction strength — %s",
+                                                    grp_label(x, names(x$list)[i])))
+        }
+      }, width = 6 * length(x$list), height = 6)
+      TRUE
+    }, error = function(e) {
+      message("  overview chord: ", conditionMessage(e)); FALSE })
+    if (ok) files <- c(files, f)
+  }
+  invisible(files)
+}
+
+fig_overview_chord_diff <- function(x, measure = c("weight", "count"),
+                                    sub = "01_networks") {
+  measure <- match.arg(measure)
+  ref <- x$list[[x$cn$ref]]@net[[measure]]
+  tst <- x$list[[x$cn$test]]@net[[measure]]
+  if (is.null(ref) || is.null(tst) || !all(dim(ref) == dim(tst))) {
+    message("  overview chord diff: matrices missing or mismatched"); return(invisible(NULL))
+  }
+  d  <- tst - ref
+  up <- pmax(d, 0); dn <- pmax(-d, 0)
+  if (sum(up) == 0 && sum(dn) == 0) {
+    message("  overview chord diff: no difference to draw"); return(invisible(NULL))
+  }
+  wmax <- max(c(up, dn), na.rm = TRUE)
+
+  f <- out_file(x, sprintf("overview_chord_diff_%s.png", measure), sub)
+  ok <- tryCatch({
+    show_png(f, function() {
+      op <- par(mfrow = c(1, 2), xpd = TRUE); on.exit(par(op))
+      for (part in c("up", "dn")) {
+        m <- if (part == "up") up else dn
+        ttl <- sprintf("%s in %s  (sum |delta| = %.3g)",
+                       if (part == "up") "higher" else "lower",
+                       x$cn$test_label, sum(m, na.rm = TRUE))
+        if (sum(m, na.rm = TRUE) == 0) { plot.new(); title(ttl); next }
+        netVisual_chord_cell(x$list[[1]], net = m, color.use = x$pal,
+                             lab.cex = 0.7, title.name = ttl)
+      }
+    }, width = 12, height = 6)
+    TRUE
+  }, error = function(e) {
+    message("  overview chord diff: ", conditionMessage(e)); FALSE })
+
+  tab <- tibble::as_tibble(as.data.frame(as.table(d))) %>%
+    stats::setNames(c("source", "target", "delta")) %>%
+    dplyr::filter(delta != 0) %>%
+    dplyr::mutate(Direction = ifelse(delta > 0,
+                                    paste("Higher in", x$cn$test_label),
+                                    paste("Lower in", x$cn$test_label)),
+                  measure = measure, Contrast = x$cn$label) %>%
+    dplyr::arrange(dplyr::desc(abs(delta)))
+  readr::write_csv(tab, out_file(x, sprintf("overview_chord_diff_%s.csv", measure), sub))
+  invisible(if (ok) f else NULL)
+}
+
+fig_overview_chord_signed <- function(x, measure = c("weight", "count"),
+                                      sub = "01_networks",
+                                      up_col = "#B2182B", down_col = "#2166AC",
+                                      min_frac = 0.01) {
+  measure <- match.arg(measure)
+  if (!requireNamespace("circlize", quietly = TRUE)) {
+    message("  signed chord: circlize not available"); return(invisible(NULL))
+  }
+  ref <- x$list[[x$cn$ref]]@net[[measure]]
+  tst <- x$list[[x$cn$test]]@net[[measure]]
+  if (is.null(ref) || is.null(tst) || !all(dim(ref) == dim(tst))) {
+    message("  signed chord: matrices missing or mismatched"); return(invisible(NULL))
+  }
+  df <- as.data.frame(as.table(tst - ref), stringsAsFactors = FALSE)
+  names(df) <- c("from", "to", "delta")
+  df <- df[is.finite(df$delta) & df$delta != 0, , drop = FALSE]
+  if (!nrow(df)) { message("  signed chord: no difference to draw"); return(invisible(NULL)) }
+  df$w <- abs(df$delta)
+  df <- df[df$w >= min_frac * max(df$w), , drop = FALSE]
+  df$col <- ifelse(df$delta > 0, up_col, down_col)
+
+  f <- out_file(x, sprintf("overview_chord_signed_%s.png", measure), sub)
+  ok <- tryCatch({
+    show_png(f, function() {
+      circlize::circos.clear()
+      on.exit(circlize::circos.clear(), add = TRUE)
+      circlize::circos.par(gap.degree = 4, start.degree = 90,
+                           points.overflow.warning = FALSE)
+      circlize::chordDiagram(
+        df[, c("from", "to", "w")], grid.col = x$pal, col = df$col,
+        directional = 1, direction.type = c("diffHeight", "arrows"),
+        link.arr.type = "big.arrow", transparency = 0.25,
+        annotationTrack = "grid",
+        preAllocateTracks = list(track.height = 0.10))
+      circlize::circos.trackPlotRegion(track.index = 1, bg.border = NA,
+        panel.fun = function(xx, yy) {
+          circlize::circos.text(
+            mean(circlize::get.cell.meta.data("xlim")), 0,
+            circlize::get.cell.meta.data("sector.index"),
+            facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5), cex = 0.7)
+        })
+      title(sprintf("%s — Delta %s", x$cn$delta,
+                    if (measure == "weight") "Interaction strength" else "Number of interactions"),
+            cex.main = 0.95)
+      legend("bottomleft", bty = "n", cex = 0.8, fill = c(up_col, down_col),
+             legend = c(paste("Higher in", x$cn$test_label),
+                        paste("Lower in", x$cn$test_label)))
+    }, width = 8, height = 8)
+    TRUE
+  }, error = function(e) { message("  signed chord: ", conditionMessage(e)); FALSE })
+  invisible(if (ok) f else NULL)
+}
+
+fig_diff <- function(x) {
+  note  <- if (is.null(x$cn$note)) NULL else wrap_txt(x$cn$note, 170)
+  n_bot <- if (is.null(note)) 0 else length(strsplit(note, "\n")[[1]]) + 1
+  draw <- function() {
+    op <- par(mfrow = c(1, 2), xpd = TRUE, mar = c(0, 0, 2, 0), oma = c(n_bot + 1, 0, 2, 0))
+    on.exit(par(op))
+    netVisual_diffInteraction(x$merged, comparison = c(1, 2), measure = "count",
+                              weight.scale = TRUE, color.use = x$pal,
+                              title.name = "Δ number of interactions")
+    netVisual_diffInteraction(x$merged, comparison = c(1, 2), measure = "weight",
+                              weight.scale = TRUE, color.use = x$pal,
+                              title.name = "Δ interaction strength")
+    mtext(sprintf("%s  (red: higher in %s, blue: lower in %s); edges at raw p",
+                  x$cn$delta, x$cn$test_label, x$cn$test_label),
+          side = 3, outer = TRUE, cex = 0.85)
+    if (!is.null(note)) mtext(note, side = 1, outer = TRUE, cex = 0.6, adj = 0, line = n_bot - 1)
+  }
+  show_png(out_file(x, "diffInteraction.png", "01_networks"), draw, 11, 5.5)
+}
+
+fig_diff_heatmap <- function(x) {
+  h_count  <- netVisual_heatmap(x$merged, comparison = c(1, 2), measure = "count",
+                                color.use = x$pal, title.name = "Δ number of interactions")
+  h_weight <- netVisual_heatmap(x$merged, comparison = c(1, 2), measure = "weight",
+                                color.use = x$pal, title.name = "Δ interaction strength")
+  note <- wrap_txt(cap(x, "Edge set thresholded at raw p < 0.05 (aggregateNet)."), 200)
+  draw <- function() {
+    ComplexHeatmap::draw(
+      h_count + h_weight, ht_gap = grid::unit(0.5, "cm"),
+      column_title = sprintf("%s  (red: higher in %s)", x$cn$delta, x$cn$test_label),
+      padding = grid::unit(c(16, 2, 2, 2), "mm"))
+    grid::grid.text(note, x = grid::unit(2, "mm"), y = grid::unit(2, "mm"),
+                    just = c("left", "bottom"),
+                    gp = grid::gpar(fontsize = 7, col = "grey30"))
+  }
+  show_png(out_file(x, "diffHeatmap.png", "01_networks"), draw, 13, 6.5)
+}
+
+fig_role_scatter <- function(x) {
+  num_link <- sapply(x$list, function(cc) {
+    rowSums(cc@net$count) + colSums(cc@net$count) - diag(cc@net$count)
+  })
+  plots <- lapply(seq_along(x$list), function(i) {
+    netAnalysis_signalingRole_scatter(
+      x$list[[i]], title = grp_label(x, names(x$list)[i]),
+      weight.MinMax = range(num_link), color.use = x$pal,
+      xlabel = "Outgoing interaction strength",
+      ylabel = "Incoming interaction strength")
+  })
+  p <- patchwork::wrap_plots(plots, ncol = 2) +
+    patchwork::plot_annotation(
+      title = paste("Signalling roles —", x$cn$label),
+      caption = wrap_txt(cap(x, paste("Shared scale across panels.",
+                                      "Edge set at raw p < 0.05."))),
+      theme = cap_theme)
+  ggsave(out_file(x, "roleScatter.png", "02_roles"), p, width = 12, height = 6.5, dpi = 300)
+  p
+}
+
+fig_flow <- function(x, split_by_type = TRUE, max_rows = 30, sub = "03_infoflow") {
+  cols <- grp_cols(x)
+  rk <- rankNet(x$merged, mode = "comparison", measure = "weight", stacked = FALSE,
+                do.stat = TRUE, comparison = c(1, 2), color.use = unname(cols),
+                return.data = TRUE)
+  raw <- rk$signaling.contribution
+  pc  <- intersect(c("pvalues", "pvalue", "p.values", "pval"), names(raw))[1]
+  stopifnot(!is.na(pc))
+
+  all_tab <- raw %>%
+    dplyr::mutate(group = as.character(group)) %>%
+    dplyr::select(name, group, contribution, contribution.scaled,
+                  pvalues = dplyr::all_of(pc)) %>%
+    dplyr::group_by(name) %>%
+    dplyr::mutate(pvalues = dplyr::first(stats::na.omit(pvalues))) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(arm = dplyr::case_when(group == x$cn$ref  ~ "ref",
+                                         group == x$cn$test ~ "test")) %>%
+    dplyr::select(-group) %>%
+    tidyr::pivot_wider(names_from = arm,
+                       values_from = c(contribution, contribution.scaled),
+                       names_glue = "{.value}_{arm}", values_fill = 0) %>%
+    dplyr::rename(flow_ref    = contribution_ref,
+                  flow_test   = contribution_test,
+                  scaled_ref  = contribution.scaled_ref,
+                  scaled_test = contribution.scaled_test) %>%
+    dplyr::mutate(
+      not_tested = pvalues == 0,
+      pvalues    = dplyr::if_else(not_tested, NA_real_, pvalues),
+      padj       = p.adjust(pvalues, method = PADJ_METHOD),
+      diff_test_minus_ref = flow_test - flow_ref)
+  n_nt <- sum(all_tab$not_tested, na.rm = TRUE)
+  if (n_nt) message(x$cn$id, ": ", n_nt,
+                    " pathway(s) with rankNet placeholder p = 0 -> NA (not tested).")
+
+  sc <- all_tab %>%
+    dplyr::filter(flow_ref > 0, flow_test > 0, !not_tested) %>%
+    dplyr::mutate(log2_test_over_ref = log2(flow_test / flow_ref)) %>%
+    dplyr::arrange(padj, pvalues)
+
+  readr::write_csv(sc,      out_file(x, "infoflow_bothArms.csv", sub))
+  readr::write_csv(all_tab, out_file(x, "infoflow_all.csv", sub))
+
+  relabel <- ggplot2::scale_fill_manual(values = cols, breaks = names(cols),
+                                        labels = grp_label(x, names(cols)), name = NULL)
+  cap_common <- paste(
+    sprintf("Grey: %s; red: %s.", x$cn$ref_label, x$cn$test_label),
+    "Pathway labels are coloured where rankNet's raw p < 0.05; adjusted p-values",
+    "appear in infoflow_*.csv only. Cell-type pairs are the units of the",
+    "Wilcoxon test, not donors, so this is descriptive.")
+
+  flow_fig <- function(paths, ttl, fname, panels = c("both", "absolute"),
+                       note = NULL) {
+    panels <- match.arg(panels)
+    paths  <- unique(as.character(paths))
+    if (!length(paths)) return(invisible(NULL))
+    rel <- if (panels == "both") {
+      rankNet(x$merged, mode = "comparison", measure = "weight", stacked = TRUE,
+              do.stat = TRUE, comparison = c(1, 2), color.use = unname(cols),
+              signaling = paths) + relabel
+    } else NULL
+    abs_p <- rankNet(x$merged, mode = "comparison", measure = "weight",
+                     stacked = FALSE, do.stat = TRUE, comparison = c(1, 2),
+                     color.use = unname(cols), show.raw = TRUE,
+                     signaling = paths) + relabel
+    body <- if (is.null(rel)) abs_p else
+      patchwork::wrap_plots(rel, abs_p, ncol = 2)
+    p <- suppressMessages(body) +
+      patchwork::plot_annotation(
+        title   = ttl,
+        caption = wrap_txt(cap(x, paste(c(note, cap_common), collapse = " "))),
+        theme   = cap_theme)
+    ggsave(out_file(x, fname, sub), p,
+           width = if (is.null(rel)) 6.5 else 11,
+           height = max(3.5, 0.17 * length(paths) + 1.8),
+           dpi = 300, limitsize = FALSE)
+    p
+  }
+
+  onoff <- all_tab %>%
+    dplyr::filter(flow_ref == 0 | flow_test == 0) %>%
+    dplyr::mutate(only_in = ifelse(flow_ref == 0, x$cn$test_label, x$cn$ref_label)) %>%
+    dplyr::arrange(dplyr::desc(pmax(flow_ref, flow_test)))
+  if (nrow(onoff)) {
+    readr::write_csv(onoff, out_file(x, "infoflow_on_off.csv", sub))
+    flow_fig(onoff$name,
+             sprintf("Information flow, one arm only — %s", x$cn$label),
+             "infoflow_on_off.png", panels = "absolute",
+             note = paste(nrow(onoff), "pathway(s) inferred in one arm and not",
+                          "the other. Absolute scale only: the relative panel is",
+                          "1.00 by construction for every one of them."))
+  }
+
+  top <- sc %>%
+    dplyr::arrange(dplyr::desc(abs(log2_test_over_ref))) %>%
+    dplyr::slice_head(n = max_rows)
+  p_main <- flow_fig(
+    top$name,
+    sprintf("Information flow — %s", x$cn$label), "infoflow.png",
+    note = sprintf(paste("Top %d of %d pathways inferred in BOTH arms, ranked by",
+                         "|log2(flow ratio)|; the complete set is in",
+                         "infoflow_all.csv. LEFT: relative contribution per",
+                         "pathway (sums to 1 per row) -- not comparable with the",
+                         "absolute values in the CSV. RIGHT: absolute information",
+                         "flow (show.raw = TRUE), identical to flow_ref/flow_test",
+                         "in infoflow_*.csv."),
+                   nrow(top), nrow(sc)))
+
+  if (split_by_type) {
+    db  <- as.data.frame(x$merged@DB$interaction)
+    if (all(c("pathway_name", "annotation") %in% names(db))) {
+      ann <- db %>%
+        dplyr::distinct(pathway_name, annotation) %>%
+        dplyr::filter(!is.na(annotation), pathway_name %in% all_tab$name)
+      for (ty in sort(unique(ann$annotation))) {
+        paths <- intersect(all_tab$name, ann$pathway_name[ann$annotation == ty])
+        if (!length(paths)) next
+        tag <- gsub("[^A-Za-z0-9]+", "_", tolower(ty))
+        flow_fig(paths,
+                 sprintf("Information flow, %s — %s", ty, x$cn$label),
+                 sprintf("infoflow_%s.png", tag),
+                 note = sprintf(paste("All %d %s pathway(s). Split by CellChatDB",
+                                      "annotation class (rankNet signaling.type);",
+                                      "a partition of the full set, not a selection."),
+                                length(paths), ty))
+      }
+    } else message(x$cn$id, ": DB lacks annotation -- skipping the per-class split")
+  }
+
+  list(plot = p_main, table = sc, all = all_tab, on_off = onoff)
+}
+
+deg_edges <- function(x, direction = c("up", "down"), lfc = DEG_LFC, pb = cc_pb_or_empty()) {
+  direction <- match.arg(direction)
+  d <- x$deg
+  if (!nrow(d)) return(d)
+  need <- setdiff(c("pathway_name", "annotation"), names(d))
+  if (length(need)) {
+    d <- dplyr::left_join(
+      d, as.data.frame(x$merged@DB$interaction)[, c("interaction_name", need), drop = FALSE],
+      by = "interaction_name")
+  }
+  d <- if (direction == "up") {
+    dplyr::filter(d, datasets == x$cn$test, ligand.logFC >= lfc)
+  } else {
+    dplyr::filter(d, datasets == x$cn$ref, ligand.logFC <= -lfc)
+  }
+  if (!nrow(d)) return(d)
+  cmp <- unname(CC_PB_COMPARISON[x$cn$id])
+  if (!is.na(cmp) && nrow(pb)) {
+    lp <- pb_lookup(d$ligand, d$source, pb, x$merged@DB, cmp)
+    d$ligand.pb_padj <- lp$pb_padj; d$ligand.pb_log2FC <- lp$pb_log2FC
+    d$ligand.pb_missing <- lp$pb_missing
+  }
+  d
+}
+
+pick_interactions <- function(e, max_pairs, np_quota = 4) {
+  if (!nrow(e) || !"interaction_name" %in% names(e)) return(character(0))
+  has_ann <- "annotation" %in% names(e)
+
+  e$interaction_name <- as.character(e$interaction_name)
+
+  d <- e %>%
+    dplyr::group_by(interaction_name) %>%
+    dplyr::summarise(
+      best = suppressWarnings(max(abs(ligand.logFC), na.rm = TRUE)),
+      np   = if (has_ann) any(annotation %in% "Non-protein Signaling") else FALSE,
+      .groups = "drop") %>%
+    dplyr::mutate(best = ifelse(is.finite(best), best, -Inf)) %>%
+    dplyr::arrange(dplyr::desc(best))
+  d$interaction_name <- as.character(d$interaction_name)
+  if (nrow(d) <= max_pairs) return(d$interaction_name)
+
+  keep <- d$interaction_name[seq_len(max_pairs)]
+  have <- sum(d$np[seq_len(max_pairs)])
+  want <- min(np_quota, sum(d$np))
+  want <- min(want, max(0L, floor(max_pairs / 2)))
+  if (want > have) {
+    extra <- utils::head(setdiff(d$interaction_name[d$np], keep), want - have)
+    if (length(extra)) {
+      keep <- c(utils::head(keep, max_pairs - length(extra)), extra)
+      message("    Non-protein quota: ", length(extra), " metabolite pair(s) kept ",
+              "in place of the weakest protein pair(s)")
+    }
+  }
+  stopifnot(length(keep) == max_pairs, is.character(keep))
+  keep
+}
+
+fig_bubble <- function(x, n = 25, lfc = DEG_LFC) {
+  out <- list()
+  for (drn in c("up", "down")) {
+    e <- deg_edges(x, drn, lfc)
+    if (!nrow(e)) next
+    pairs <- e %>%
+      dplyr::group_by(interaction_name) %>%
+      dplyr::summarise(best = max(abs(ligand.logFC)), .groups = "drop") %>%
+      dplyr::arrange(dplyr::desc(best)) %>%
+      dplyr::slice_head(n = n) %>%
+      dplyr::select(interaction_name) %>%
+      as.data.frame()
+    ttl <- if (drn == "up") {
+      sprintf("Ligand higher in %s (logFC ≥ %.2g) — %s", x$cn$test_label, lfc, x$cn$label)
+    } else {
+      sprintf("Ligand lower in %s (logFC ≤ −%.2g) — %s", x$cn$test_label, lfc, x$cn$label)
+    }
+    p <- tryCatch(
+      netVisual_bubble(x$merged, pairLR.use = pairs, comparison = c(1, 2),
+                       angle.x = 45, remove.isolate = TRUE,
+                       color.text = unname(GRP_COLS[c("ref", "test")]),
+                       title.name = ttl),
+      error = function(e) { message(x$cn$id, " bubble ", drn, ": ", conditionMessage(e)); NULL })
+    if (is.null(p)) next
+    p <- p + theme(axis.text.x = element_text(size = 7)) +
+      labs(caption = wrap_txt(cap(x, paste(sprintf(
+        "Top %d L-R pairs by ligand |logFC|. Axis labels grey: %s, red: %s.",
+        nrow(pairs), x$cn$ref_label, x$cn$test_label),
+        deg_caption())))) + cap_theme
+    ggsave(out_file(x, sprintf("bubble_%s.png", drn), "05_deg"), p, width = 10, height = 6.5, dpi = 300)
+    out[[drn]] <- p
+  }
+  out
+}
+
+fig_chord <- function(x, lfc = DEG_LFC, max_pairs = 30, np_quota = 4,
+                      sources.use = NULL, targets.use = NULL) {
+  files <- character(0)
+  for (drn in c("up", "down")) {
+    e <- deg_edges(x, drn, lfc)
+    if (!nrow(e)) { message("  chord ", drn, ": no edges"); next }
+
+    n_pairs <- dplyr::n_distinct(e$interaction_name)
+    if (n_pairs > max_pairs) {
+      keep <- pick_interactions(e, max_pairs, np_quota)
+      message("  chord ", drn, ": ", n_pairs, " pairs -> ", length(keep),
+              " by |logFC|")
+      e <- e[as.character(e$interaction_name) %in% keep, , drop = FALSE]
+    }
+
+    arm <- if (drn == "up") x$cn$test else x$cn$ref
+    obj <- x$list[[arm]]
+    ttl <- if (drn == "up") {
+      sprintf("Ligand higher in %s", x$cn$test_label)
+    } else {
+      sprintf("Ligand lower in %s", x$cn$test_label)
+    }
+    f <- out_file(x, sprintf("chord_%s.png", drn), "05_deg")
+    ok <- tryCatch({
+      show_png(f, function() {
+        netVisual_chord_gene(obj, slot.name = "net", net = e,
+                             color.use = x$pal,
+                             sources.use = sources.use, targets.use = targets.use,
+                             lab.cex = 0.6, small.gap = 3.5,
+                             title.name = paste0(ttl, " — ", grp_label(x, arm)))
+      }, width = 9, height = 9)
+      TRUE
+    }, error = function(err) {
+      message("  chord ", drn, ": ", conditionMessage(err)); FALSE })
+    if (ok) files <- c(files, f)
+  }
+  invisible(files)
+}
+
+fig_chord_genes <- function(x, lfc = DEG_LFC, max_pairs = 20, np_quota = 4,
+                            sub = "05_deg",
+                            lab_cex = 0.75, label_track = 0.28) {
+  if (!requireNamespace("circlize", quietly = TRUE)) {
+    message("  gene chord: circlize not available"); return(invisible(NULL))
+  }
+  files <- character(0)
+  for (drn in c("up", "down")) {
+    e <- deg_edges(x, drn, lfc)
+    if (!nrow(e)) { message("  gene chord ", drn, ": no edges"); next }
+
+    n_all <- dplyr::n_distinct(e$interaction_name)
+    if (n_all > max_pairs) {
+      keep <- pick_interactions(e, max_pairs, np_quota)
+      e <- e[as.character(e$interaction_name) %in% keep, , drop = FALSE]
+    }
+    e <- e[order(-abs(e$ligand.logFC)), , drop = FALSE]
+
+    df <- data.frame(
+      from = paste0(e$ligand,   " (", as.character(e$source), ")"),
+      to   = paste0(e$receptor, " (", as.character(e$target), ")"),
+      w    = if ("prob" %in% names(e)) pmax(e$prob, 0) else abs(e$ligand.logFC),
+      src  = as.character(e$source), tgt = as.character(e$target),
+      stringsAsFactors = FALSE)
+    df <- df[is.finite(df$w) & df$w > 0, , drop = FALSE]
+    if (!nrow(df)) { message("  gene chord ", drn, ": no positive weights"); next }
+
+    sect <- unique(data.frame(
+      name = c(df$from, df$to),
+      ct   = c(df$src,  df$tgt), stringsAsFactors = FALSE))
+    sect <- sect[!duplicated(sect$name), , drop = FALSE]
+    grid_col <- stats::setNames(unname(x$pal[sect$ct]), sect$name)
+    grid_col[is.na(grid_col)] <- "grey70"
+    link_col <- unname(x$pal[df$src]); link_col[is.na(link_col)] <- "grey70"
+
+    arm <- if (drn == "up") x$cn$test else x$cn$ref
+    ttl <- sprintf("%s — ligand %s in %s (top %d of %d)",
+                   grp_label(x, arm),
+                   if (drn == "up") "higher" else "lower",
+                   x$cn$test_label, nrow(df), n_all)
+
+    f <- out_file(x, sprintf("chord_genes_%s.png", drn), sub)
+    ok <- tryCatch({
+      show_png(f, function() {
+        circlize::circos.clear()
+        on.exit(circlize::circos.clear(), add = TRUE)
+        circlize::circos.par(gap.degree = 2, start.degree = 90,
+                             points.overflow.warning = FALSE)
+        circlize::chordDiagram(
+          df[, c("from", "to", "w")],
+          grid.col = grid_col, col = link_col,
+          directional = 1, direction.type = c("diffHeight", "arrows"),
+          link.arr.type = "big.arrow", transparency = 0.3,
+          annotationTrack = "grid",
+          preAllocateTracks = list(track.height = label_track))
+        circlize::circos.trackPlotRegion(track.index = 1, bg.border = NA,
+          panel.fun = function(xx, yy) {
+            circlize::circos.text(
+              mean(circlize::get.cell.meta.data("xlim")), 0,
+              circlize::get.cell.meta.data("sector.index"),
+              facing = "clockwise", niceFacing = TRUE,
+              adj = c(0, 0.5), cex = lab_cex)
+          })
+        title(ttl, cex.main = 0.95)
+        ctu <- intersect(names(x$pal), unique(c(df$src, df$tgt)))
+        legend("bottomleft", legend = ctu, fill = unname(x$pal[ctu]),
+               bty = "n", cex = 0.7, title = "Cell type")
+      }, width = 10, height = 10)
+      TRUE
+    }, error = function(err) {
+      message("  gene chord ", drn, ": ", conditionMessage(err)); FALSE })
+    if (ok) files <- c(files, f)
+
+    readr::write_csv(
+      df %>% dplyr::select(from, to, weight = w, source = src, target = tgt) %>%
+        dplyr::mutate(direction = drn, Contrast = x$cn$label),
+      out_file(x, sprintf("chord_genes_%s.csv", drn), sub))
+  }
+  invisible(files)
+}
+
+enrichment_scores <- function(e, db = NULL, variable.both = TRUE) {
+  need <- c("interaction_name", "ligand.logFC", "receptor.logFC",
+            "ligand.pct.1", "ligand.pct.2", "receptor.pct.1", "receptor.pct.2")
+  miss <- setdiff(need, names(e))
+  if (length(miss)) {
+    message("  enrichment: missing column(s) ", paste(miss, collapse = ", "))
+    return(NULL)
+  }
+  e <- e[, unique(c(need, intersect(c("ligand", "receptor", "pathway_name",
+                                      "annotation"), names(e)))), drop = FALSE]
+  e$interaction_name <- as.character(e$interaction_name)
+  if (isTRUE(variable.both)) e <- e[stats::complete.cases(e[, need]), , drop = FALSE]
+  if (!nrow(e)) return(NULL)
+  e$.es <- abs(e$ligand.logFC) * abs(e$receptor.logFC) *
+    abs(e$ligand.pct.2 - e$ligand.pct.1) *
+    abs(e$receptor.pct.2 - e$receptor.pct.1)
+  e %>%
+    dplyr::group_by(interaction_name) %>%
+    dplyr::summarise(
+      score       = mean(.es, na.rm = TRUE),
+      ligand      = dplyr::first(ligand),
+      receptor    = dplyr::first(receptor),
+      pathway_name = if ("pathway_name" %in% names(e)) dplyr::first(pathway_name)
+                     else NA_character_,
+      annotation  = if ("annotation" %in% names(e)) dplyr::first(annotation)
+                    else NA_character_,
+      n_edges     = dplyr::n(),
+      .groups = "drop") %>%
+    dplyr::filter(is.finite(score)) %>%
+    dplyr::arrange(dplyr::desc(score))
+}
+
+fig_wordcloud <- function(x, lfc = DEG_LFC, measure = "ligand",
+                          species = "human", top_n = 25, sub = "05_deg") {
+  files <- character(0)
+  for (drn in c("up", "down")) {
+    e <- deg_edges(x, drn, lfc)
+    if (!nrow(e)) { message("  wordcloud ", drn, ": no edges"); next }
+    ttl <- if (drn == "up") x$cn$test_label else x$cn$ref_label
+
+    es <- enrichment_scores(e)
+    if (!is.null(es) && nrow(es)) {
+      readr::write_csv(es, out_file(x, sprintf("enrichment_%s_pairs.csv", drn), sub))
+      lig <- es %>% dplyr::group_by(ligand) %>%
+        dplyr::summarise(total = sum(score), n_pairs = dplyr::n(), .groups = "drop") %>%
+        dplyr::arrange(dplyr::desc(total))
+      readr::write_csv(lig, out_file(x, sprintf("enrichment_%s_ligand.csv", drn), sub))
+      pw <- es %>% dplyr::filter(!is.na(pathway_name)) %>%
+        dplyr::group_by(pathway_name) %>%
+        dplyr::summarise(total = sum(score), n_pairs = dplyr::n(), .groups = "drop") %>%
+        dplyr::arrange(dplyr::desc(total))
+      if (nrow(pw))
+        readr::write_csv(pw, out_file(x, sprintf("enrichment_%s_pathway.csv", drn), sub))
+
+      bar <- lig %>% dplyr::slice_head(n = top_n) %>%
+        dplyr::mutate(ligand = factor(ligand, levels = rev(ligand)))
+      pb <- ggplot(bar, aes(x = total, y = ligand)) +
+        geom_col(fill = unname(if (drn == "up") GRP_COLS["test"] else GRP_COLS["ref"])) +
+        labs(x = "Enrichment score (sum over L-R pairs)", y = NULL,
+             title = sprintf("Enriched ligands — %s", ttl),
+             caption = wrap_txt(cap(x, paste(
+               sprintf("Top %d of %d ligands.", nrow(bar), nrow(lig)),
+               "Score = mean(|ligand logFC| x |receptor logFC| x |d ligand pct|",
+               "x |d receptor pct|) per L-R pair, summed over the pairs sharing",
+               "a ligand. This is a differential-expression quantity and contains",
+               "no communication probability -- it is NOT comparable with the",
+               "information-flow figure.")))) +
+        theme_classic(base_size = 9) + cap_theme
+      ggsave(out_file(x, sprintf("enrichment_%s_bar.png", drn), sub), pb,
+             width = 6, height = max(3, 0.18 * nrow(bar) + 1.4), dpi = 300)
+    }
+
+    if (!requireNamespace("wordcloud", quietly = TRUE)) {
+      message("  wordcloud: package not installed (CellChat Suggests) -- ",
+              "install.packages('wordcloud') to enable")
+      next
+    }
+    f <- out_file(x, sprintf("wordcloud_%s.png", drn), sub)
+    ok <- tryCatch({
+      show_png(f, function() {
+        op <- par(mar = c(0, 0, 2, 0)); on.exit(par(op))
+        computeEnrichmentScore(e, measure = measure, species = species)
+        title(main = sprintf("Enriched ligands — %s (%s)", ttl, drn), cex.main = 0.9)
+      }, width = 7, height = 7)
+      TRUE
+    }, error = function(err) {
+      message("  wordcloud ", drn, ": ", conditionMessage(err)); FALSE })
+    if (ok) files <- c(files, f)
+  }
+  invisible(files)
+}
+
+fig_lr_table <- function(x, sig_thresh = SIG_THRESH, min_abs_diff = 0) {
+  comm <- safe_comm(x$merged, thresh = 1.01)
+  if (!nrow(comm)) return(NULL)
+
+  wide <- comm %>%
+    dplyr::mutate(arm = dplyr::case_when(datasets == x$cn$ref  ~ "ref",
+                                         datasets == x$cn$test ~ "test")) %>%
+    dplyr::filter(!is.na(arm)) %>%
+    dplyr::select(source, target, interaction_name,
+                  dplyr::any_of(c("interaction_name_2", "pathway_name", "ligand",
+                                  "receptor", "annotation")),
+                  arm, prob, pval) %>%
+    tidyr::pivot_wider(names_from = arm, values_from = c(prob, pval),
+                       names_glue = "{.value}_{arm}")
+  for (cl in c("prob_ref", "prob_test")) if (!cl %in% names(wide)) wide[[cl]] <- 0
+  for (cl in c("pval_ref", "pval_test")) if (!cl %in% names(wide)) wide[[cl]] <- NA_real_
+  wide$prob_ref  <- dplyr::coalesce(wide$prob_ref,  0)
+  wide$prob_test <- dplyr::coalesce(wide$prob_test, 0)
+
+  nb <- cc_nboot_of(x)
+  wide$pperm_ref  <- perm_p_unbiased(wide$pval_ref,  nb)
+  wide$pperm_test <- perm_p_unbiased(wide$pval_test, nb)
+  wide$padj_ref   <- padj_arm(wide$pperm_ref,  wide$prob_ref)
+  wide$padj_test  <- padj_arm(wide$pperm_test, wide$prob_test)
+
+  sig_ref  <- wide$pval_ref  < sig_thresh & wide$prob_ref  > 0
+  sig_test <- wide$pval_test < sig_thresh & wide$prob_test > 0
+  sig_ref[is.na(sig_ref)] <- FALSE; sig_test[is.na(sig_test)] <- FALSE
+
+  wide <- wide %>%
+    dplyr::mutate(
+      prob_diff_test_minus_ref = prob_test - prob_ref,
+      sig_in = dplyr::case_when(sig_test & !sig_ref ~ "test_only",
+                                sig_ref & !sig_test ~ "ref_only",
+                                sig_test & sig_ref  ~ "both",
+                                TRUE ~ "none"),
+      sig_in_label = dplyr::case_when(
+        sig_in == "test_only" ~ paste("Significant only in", x$cn$test_label),
+        sig_in == "ref_only"  ~ paste("Significant only in", x$cn$ref_label),
+        sig_in == "both"      ~ "Significant in both groups",
+        TRUE ~ "Significant in neither group")) %>%
+    dplyr::filter(sig_in != "none", abs(prob_diff_test_minus_ref) >= min_abs_diff) %>%
+    dplyr::arrange(dplyr::desc(abs(prob_diff_test_minus_ref)))
+
+  readr::write_csv(wide, out_file(x, "LR_differential.csv", "06_lr_tables"))
+  wide
+}
+
+padj_report <- function(x, fl = NULL, sig_thresh = SIG_THRESH, pb = cc_pb_or_empty()) {
+  rows <- list()
+  nb <- cc_nboot_of(x)
+  comm <- safe_comm(x$merged, thresh = 1.01)
+
+  if (nrow(comm)) {
+    for (arm in c("ref", "test")) {
+      g  <- x$cn[[arm]]
+      cc <- comm[comm$datasets == g & !is.na(comm$prob) & comm$prob > 0, , drop = FALSE]
+      if (!nrow(cc)) next
+      pp   <- perm_p_unbiased(cc$pval, nb)
+      padj <- p.adjust(pp, method = PADJ_METHOD)
+      rows[[length(rows) + 1]] <- tibble::tibble(
+        Family = sprintf("Communication edges — %s", grp_label(x, g)),
+        `n tests` = nrow(cc),
+        `sig. raw` = sum(pp < sig_thresh, na.rm = TRUE),
+        `sig. padj` = sum(padj < sig_thresh, na.rm = TRUE),
+        `gated on` = "raw p (protocol)")
+    }
+  }
+
+  cmp <- unname(CC_PB_COMPARISON[x$cn$id])
+  if (!is.na(cmp) && !is.null(pb) && nrow(pb)) {
+    p2 <- pb[pb$comparison == cmp & pb$status == "ok", , drop = FALSE]
+    if (nrow(p2)) {
+      rows[[length(rows) + 1]] <- tibble::tibble(
+        Family = sprintf("Donor pseudobulk (gene x cell type) — %s", cmp),
+        `n tests` = nrow(p2),
+        `sig. raw` = sum(p2$pvalue < sig_thresh, na.rm = TRUE),
+        `sig. padj` = sum(p2$padj < sig_thresh, na.rm = TRUE),
+        `gated on` = "annotation only")
+    }
+  }
+
+  if (!is.null(fl) && nrow(fl)) {
+    rows[[length(rows) + 1]] <- tibble::tibble(
+      Family = "Information flow (pathways)",
+      `n tests` = sum(!fl$not_tested, na.rm = TRUE),
+      `sig. raw` = sum(fl$pvalues < sig_thresh, na.rm = TRUE),
+      `sig. padj` = sum(fl$padj    < sig_thresh, na.rm = TRUE),
+      `gated on` = "reported only (plot uses raw p)")
+  }
+
+  if (!length(rows)) return(tibble::tibble())
+  dplyr::bind_rows(rows)
+}
+```
+
+## 6.5 Ligand-receptor violins
+
+```{r cc-violins}
+sig_lr <- function(x, lfc = DEG_LFC, max_n = 20, np_quota = 4) {
+  e <- dplyr::bind_rows(up = deg_edges(x, "up", lfc), down = deg_edges(x, "down", lfc),
+                        .id = "direction")
+  if (!nrow(e)) return(e)
+  min_or_na <- function(v) if (all(is.na(v))) NA_real_ else min(v, na.rm = TRUE)
+  max_abs_or_na <- function(v) {
+    i <- which.max(abs(v))
+    if (!length(i)) NA_real_ else v[i]
+  }
+  for (cl in c("ligand.pb_padj", "ligand.pb_log2FC")) {
+    if (!cl %in% names(e)) e[[cl]] <- NA_real_
+  }
+  e %>%
+    dplyr::group_by(interaction_name, direction) %>%
+    dplyr::summarise(
+      pathway_name = dplyr::first(pathway_name),
+      annotation   = dplyr::first(annotation),
+      ligand       = dplyr::first(ligand),
+      receptor     = dplyr::first(receptor),
+      n_edges      = dplyr::n(),
+      edges        = paste(unique(paste(source, target, sep = " → ")), collapse = "; "),
+      ligand.logFC     = max_abs_or_na(ligand.logFC),
+      ligand.pb_padj   = min_or_na(ligand.pb_padj),
+      ligand.pb_log2FC = max_abs_or_na(ligand.pb_log2FC),
+      ligand.pvalues   = min_or_na(ligand.pvalues),
+      comm_pval_min    = min_or_na(pval),
+      .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(abs(ligand.logFC)), comm_pval_min) %>%
+    dplyr::filter(as.character(interaction_name) %in%
+                    pick_interactions(e, max_n, np_quota)) %>%
+    dplyr::slice_head(n = max_n)
+}
+
+violin_lr <- function(x, s, lig, rec) {
+  stopifnot(is.character(lig), is.character(rec), !is.na(lig), !is.na(rec))
+  lig_g <- resolve_genes(lig, x$merged@DB)
+  rec_g <- resolve_genes(rec, x$merged@DB)
+  want  <- unique(c(lig_g, rec_g))
+  genes <- want[want %in% rownames(s)]
+  miss  <- setdiff(want, genes)
+  if (!length(genes)) { message("no genes found: ", lig, " / ", rec); return(NULL) }
+
+  role <- ifelse(genes %in% lig_g & genes %in% rec_g, "L/R",
+                 ifelse(genes %in% lig_g, "L", "R"))
+  sub <- paste0(x$cn$label, " · ", paste0(genes, " (", role, ")", collapse = ", "),
+                if (length(miss)) paste0(" · missing: ", paste(miss, collapse = ", ")) else "")
+
+  cols <- unname(GRP_COLS[c("ref", "test")])
+  p <- if (length(genes) > 1) {
+    Seurat::VlnPlot(s, features = genes, group.by = ".ct", split.by = ".grp",
+                    pt.size = 0, stack = TRUE, flip = TRUE, cols = cols)
+  } else {
+    Seurat::VlnPlot(s, features = genes, group.by = ".ct", split.by = ".grp",
+                    pt.size = 0, cols = cols)
+  }
+
+  p + labs(title = paste0(lig, " → ", rec), subtitle = sub,
+           caption = wrap_txt(cap(x, paste(
+             "L = ligand, or the metabolite's synthesis/transport genes; R = receptor.",
+             "A high communication probability without receptor expression",
+             "indicates an artefact.", deg_caption())), 110)) +
+    theme(plot.subtitle = element_text(size = 8, colour = "grey35"),
+          plot.caption  = element_text(size = 7, colour = "grey45", hjust = 0))
+}
+
+make_violins <- function(x, seu_full = seu, ...) {
+  tab <- sig_lr(x, ...)
+  if (!nrow(tab)) {
+    message("no L-R pairs after DEG selection: ", x$cn$id)
+    return(NULL)
+  }
+  d <- out_dir_for(x, "09_violins")
+
+  cells <- rownames(x$meta)
+  s <- base::subset(seu_full, cells = cells)
+  s$.grp <- factor(as.character(x$meta[colnames(s), x$cn$col]),
+                   levels = c(x$cn$ref, x$cn$test),
+                   labels = c(x$cn$ref_label, x$cn$test_label))
+  s$.ct  <- droplevels(factor(x$meta[colnames(s), IDENTS_COL]))
+
+  ps <- lapply(seq_len(nrow(tab)), function(i) {
+    p <- violin_lr(x, s, tab$ligand[i], tab$receptor[i])
+    if (is.null(p)) return(NULL)
+    ggsave(file.path(d, sprintf("%02d_%s_%s.png", i, tab$direction[i],
+                                gsub("[^A-Za-z0-9]", "_", tab$interaction_name[i]))),
+           p, width = 7, height = 5, dpi = 300)
+    p
+  })
+  readr::write_csv(tab, file.path(d, "significant_lr.csv"))
+  list(table = tab, plots = Filter(Negate(is.null), ps))
+}
+```
+
+## 6.6 Run
+
+```{r cc-render, results='asis', fig.width=11, fig.height=6}
+for (id in names(CC)) {
+  x <- CC[[id]]
+  cat("\n\n###", x$cn$label, "\n\n")
+  if (!is.null(x$cn$note)) cat(">", x$cn$note, "\n\n")
+  cat(">", protocol_caption(), "\n\n>", lr_caption(), "\n\n>", deg_caption(), "\n\n")
+
+  fig_overview(x)
+  fig_overview_chord_diff(x)
+  fig_overview_chord_signed(x)
+  fig_diff(x)
+  fig_diff_heatmap(x)
+  print(fig_role_scatter(x)); cat("\n\n")
+
+  fl <- fig_flow(x)
+  print(fl$plot); cat("\n\n")
+  print(knitr::kable(head(fl$table, 20), digits = 4,
+                     caption = cap(x, "Information flow (> 0 in both groups), ordered by padj.")))
+  cat("\n\n")
+
+  for (b in fig_bubble(x)) { print(b); cat("\n\n") }
+  fig_chord(x)
+  fig_chord_genes(x)
+  fig_wordcloud(x)
+
+  lr <- fig_lr_table(x)
+  if (!is.null(lr) && nrow(lr)) {
+    print(knitr::kable(
+      head(lr, 25) %>% dplyr::select(source, target, dplyr::any_of(c("interaction_name_2", "pathway_name")),
+                                     prob_ref, prob_test, prob_diff_test_minus_ref,
+                                     pperm_ref, padj_ref, pperm_test, padj_test, sig_in_label),
+      digits = 4, caption = cap(x, paste(sprintf("Top differential L-R edges by |Δ probability| (%s).",
+                                                 x$cn$delta), lr_caption()))))
+    cat("\n\n")
+  }
+
+  print(knitr::kable(padj_report(x, fl$all), caption = cap(x, sprintf(
+    "Test families: raw vs %s-adjusted significant, threshold %s.", PADJ_METHOD, format(SIG_THRESH)))))
+  cat("\n\n")
+
+  vs <- make_violins(x, seu_full = seu)
+  if (!is.null(vs)) {
+    print(knitr::kable(vs$table %>%
+      dplyr::select(interaction_name, direction, pathway_name, annotation, n_edges,
+                    ligand.logFC, ligand.pb_log2FC, ligand.pb_padj, ligand.pvalues, comm_pval_min),
+      digits = 3, caption = cap(x, paste(sprintf(
+        "L-R pairs with a DE ligand (logFC > 0: higher in %s); ligand.pb_* = donor-level pseudobulk.",
+        x$cn$test_label), deg_caption()))))
+    cat("\n\n")
+    for (p in vs$plots) { print(p); cat("\n\n") }
+  }
+}
+```
+
+## 6.7 Extended analyses
+
+```{r cc-extended}
+avail_pathways <- function(x) {
+  sort(Reduce(union, lapply(x$list, function(o) o@netP$pathways)))
+}
+
+np_pathways <- function(x) {
+  db <- as.data.frame(x$merged@DB$interaction)
+  if (!"annotation" %in% names(db)) return(character(0))
+  np <- unique(db$pathway_name[db$annotation == "Non-protein Signaling"])
+  sort(intersect(np, avail_pathways(x)))
+}
+
+fig_signaling_changes <- function(x, idents = NULL, exclude = "MIF",
+                                  label_shared = TRUE, shared_max_overlaps = 12,
+                                  label_size = 3.4, sub = "02_roles") {
+  cts   <- if (is.null(idents)) x$ct else intersect(idents, x$ct)
+  excl  <- intersect(exclude, avail_pathways(x))
+  out <- list()
+  for (ct in cts) {
+    tag <- gsub("[^A-Za-z0-9]+", "_", ct)
+    p <- tryCatch(
+      netAnalysis_signalingChanges_scatter(
+        x$merged, idents.use = ct, comparison = c(1, 2),
+        signaling.exclude = if (length(excl)) excl else NULL,
+        label.size = label_size,
+        title = sprintf("%s — %s", ct, x$cn$delta)),
+      error = function(e) {
+        message("  signalingChanges '", ct, "': ", conditionMessage(e)); NULL })
+    if (is.null(p)) next
+
+    d <- p$data
+    if (!is.null(d) && nrow(d)) {
+      tab <- tibble::as_tibble(d)
+      if ("labels" %in% names(tab)) tab <- dplyr::rename(tab, pathway = labels)
+      tab <- tab %>%
+        dplyr::mutate(celltype = ct, Contrast = x$cn$label, .before = 1) %>%
+        dplyr::arrange(dplyr::desc(abs(outgoing) + abs(incoming)))
+      readr::write_csv(tab, out_file(x, sprintf("signalingChanges_%s.csv", tag), sub))
+    }
+
+    if (!is.null(d) && "labels" %in% names(d)) {
+      is_repel <- vapply(p$layers,
+                         function(l) inherits(l$geom, "GeomTextRepel"), logical(1))
+      p$layers <- p$layers[!is_repel]
+
+      has_spec <- "specificity" %in% names(d)
+      d_spec   <- if (has_spec) d[as.character(d$specificity) != "Shared", , drop = FALSE] else d
+      d_shared <- if (has_spec) d[as.character(d$specificity) == "Shared", , drop = FALSE] else d[0, ]
+
+      if (nrow(d_spec)) {
+        p <- p + ggrepel::geom_text_repel(
+          data = d_spec, mapping = aes(label = labels, colour = specificity),
+          size = label_size, fontface = "bold", show.legend = FALSE,
+          max.overlaps = Inf, min.segment.length = 0,
+          box.padding = 0.6, point.padding = 0.25,
+          segment.size = 0.25, segment.alpha = 0.6)
+      }
+      if (label_shared && nrow(d_shared)) {
+        p <- p + ggrepel::geom_text_repel(
+          data = d_shared, mapping = aes(label = labels),
+          colour = "grey35", size = label_size * 0.85, show.legend = FALSE,
+          max.overlaps = shared_max_overlaps, min.segment.length = 0.2,
+          box.padding = 0.4, point.padding = 0.2,
+          segment.size = 0.2, segment.alpha = 0.4)
+      }
+      message("  ", ct, ": ", nrow(d), " Pathways (", nrow(d_spec),
+              " group-specific, ", nrow(d_shared), " shared)")
+    }
+
+    p <- p + labs(caption = wrap_txt(cap(x, paste(
+      sprintf("Differential incoming/outgoing signalling strength for %s.", ct),
+      sprintf("Right/upper = higher in %s.", x$cn$test_label),
+      "COLOUR = the group a signal is specific to;",
+      "SHAPE = whether that specificity is outgoing, incoming, or both.",
+      paste("Group-specific pathways are always labelled (bold, coloured);",
+            if (label_shared)
+              "shared pathways (grey) only where space allows --"
+            else "shared pathways are not labelled --"),
+      "full list in signalingChanges_<celltype>.csv.",
+      if (length(excl)) sprintf("Excluded: %s.", toString(excl)) else "")))) +
+      cap_theme
+    ggsave(out_file(x, sprintf("signalingChanges_%s.png", tag), sub),
+           p, width = 8.5, height = 6.5, dpi = 300)
+    out[[ct]] <- p
+  }
+  out
+}
+
+fig_role_patterns <- function(x, patterns = c("outgoing", "incoming")) {
+  pu <- avail_pathways(x)
+  if (!length(pu)) return(invisible(NULL))
+  files <- character(0)
+  for (pt in patterns) {
+    hts <- lapply(seq_along(x$list), function(i) {
+      tryCatch(netAnalysis_signalingRole_heatmap(
+        x$list[[i]], pattern = pt, signaling = pu,
+        title = grp_label(x, names(x$list)[i]), color.use = x$pal,
+        width = 5, height = 9, font.size = 7),
+        error = function(e) {
+          message("  signalingRole_heatmap ", pt, ": ", conditionMessage(e)); NULL })
+    })
+    hts <- Filter(Negate(is.null), hts)
+    if (!length(hts)) next
+    f <- out_file(x, sprintf("signalingRole_%s.png", pt), "02_roles")
+    show_png(f, function() ComplexHeatmap::draw(Reduce(`+`, hts),
+                                                ht_gap = grid::unit(0.5, "cm")),
+             width = 5.5 * length(hts), height = 9)
+    files <- c(files, f)
+  }
+  invisible(files)
+}
+
+fig_pathway_detail <- function(x, signaling, sub = "07_pathways") {
+  pws  <- intersect(signaling, avail_pathways(x))
+  miss <- setdiff(signaling, avail_pathways(x))
+  if (length(miss)) message("  not inferred, skipped: ", toString(miss))
+  for (pw in pws) {
+    tag <- gsub("[^A-Za-z0-9]+", "_", pw)
+
+    tryCatch(
+      show_png(out_file(x, sprintf("pathway_%s_network.png", tag), sub),
+               function() {
+                 op <- par(mfrow = c(1, length(x$list)), xpd = TRUE)
+                 on.exit(par(op))
+                 for (i in seq_along(x$list)) {
+                   netVisual_aggregate(
+                     x$list[[i]], signaling = pw, layout = "circle",
+                     color.use = x$pal,
+                     signaling.name = paste(pw, "—", grp_label(x, names(x$list)[i])))
+                 }
+               }, width = 5 * length(x$list), height = 5),
+      error = function(e) message("  ", pw, " network: ", conditionMessage(e)))
+
+    ps <- lapply(seq_along(x$list), function(i) {
+      tryCatch(netAnalysis_contribution(
+        x$list[[i]], signaling = pw,
+        title = paste("L-R pair contribution —", grp_label(x, names(x$list)[i]))),
+        error = function(e) NULL)
+    })
+    ps <- Filter(Negate(is.null), ps)
+    if (length(ps)) {
+      p <- patchwork::wrap_plots(ps, ncol = length(ps)) +
+        patchwork::plot_annotation(title = paste(pw, "—", x$cn$label),
+                                   caption = wrap_txt(cap(x, lr_caption())),
+                                   theme = cap_theme)
+      ggsave(out_file(x, sprintf("pathway_%s_contribution.png", tag), sub), p,
+             width = 5 * length(ps), height = 4.5, dpi = 300)
+    }
+  }
+  invisible(pws)
+}
+
+fig_metabolite <- function(x) {
+  pws <- np_pathways(x)
+  if (!length(pws)) {
+    message(x$cn$id, ": no Non-protein Signaling pathway inferred."); return(invisible(NULL))
+  }
+  message(x$cn$id, ": Non-protein pathways: ", toString(pws))
+  fig_pathway_detail(x, pws, sub = "08_metabolite")
+
+  for (pw in pws) {
+    tag <- gsub("[^A-Za-z0-9]+", "_", pw)
+    ps <- lapply(seq_along(x$list), function(i) {
+      tryCatch(plotGeneExpression(x$list[[i]], signaling = pw, type = "violin",
+                                  enriched.only = TRUE) +
+                 patchwork::plot_annotation(title = grp_label(x, names(x$list)[i])),
+               error = function(e) {
+                 message("  ", pw, " genes: ", conditionMessage(e)); NULL })
+    })
+    ps <- Filter(Negate(is.null), ps)
+    if (!length(ps)) next
+    p <- patchwork::wrap_plots(ps, ncol = length(ps))
+    ggsave(out_file(x, sprintf("metabolite_%s_genes.png", tag), "08_metabolite"),
+           p, width = 6 * length(ps), height = 6, dpi = 300)
+  }
+  invisible(pws)
+}
+
+PATHWAYS_OF_INTEREST <- c("MHC-II", "MHC-I", "CD86", "CDICAM", "MIF", "GALECTIN",
+                          "APP", "SPP1", "IL16", "CD45", "TGFb", "CCL", "CXCL")
+```
+
+```{r cc-extended-run, results='asis', fig.width=11, fig.height=6}
+for (id in names(CC)) {
+  x <- CC[[id]]
+  cat("\n\n###", x$cn$label, "— extended\n\n")
+  for (p in fig_signaling_changes(x)) { print(p); cat("\n\n") }
+  fig_role_patterns(x)
+  fig_pathway_detail(x, PATHWAYS_OF_INTEREST)
+  fig_metabolite(x)
+}
+```
+
+## 6.8 Per-donor validation of single edges
+
+```{r cc-validate}
+.triMean <- function(v) {
+  q <- stats::quantile(v, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+  unname((q[1] + 2 * q[2] + q[3]) / 4)
+}
+
+.fun_mean <- function(v) {
+  if (identical(CC_MEAN_TYPE, "truncatedMean")) mean(v, trim = CC_TRIM, na.rm = TRUE)
+  else if (identical(CC_MEAN_TYPE, "triMean"))  .triMean(v)
+  else mean(v, na.rm = TRUE)
+}
+
+.complex_expr <- function(mat, genes, cells) {
+  genes <- intersect(genes, rownames(mat))
+  if (!length(genes) || !length(cells)) return(NA_real_)
+  v <- vapply(genes, function(g) .fun_mean(mat[g, cells]), numeric(1))
+  if (length(v) == 1) unname(v) else exp(mean(log(pmax(v, 0) + 1e-12)))
+}
+
+validation_data <- function(x, seu_full = seu) {
+  cells <- rownames(x$meta)
+  list(dat  = prep_matrix(base::subset(seu_full, cells = cells))[, cells, drop = FALSE],
+       meta = x$meta)
+}
+
+per_donor_edge <- function(x, ligand, receptor, source, target,
+                           vd = NULL, seu_full = seu, min_cells = 10) {
+  if (is.null(vd)) vd <- validation_data(x, seu_full)
+  dat <- vd$dat; md <- vd$meta
+  lig_g <- resolve_genes(ligand,  x$merged@DB)
+  rec_g <- resolve_genes(receptor, x$merged@DB)
+
+  donors <- unique(as.character(md[[DONOR_COL]]))
+  rows <- lapply(donors, function(dn) {
+    in_d  <- as.character(md[[DONOR_COL]]) == dn
+    grp   <- unique(as.character(md[[x$cn$col]][in_d]))
+    if (length(grp) != 1) return(NULL)
+    c_src <- rownames(md)[in_d & as.character(md[[IDENTS_COL]]) == source]
+    c_tgt <- rownames(md)[in_d & as.character(md[[IDENTS_COL]]) == target]
+    data.frame(
+      donor = dn, group = grp,
+      n_source = length(c_src), n_target = length(c_tgt),
+      ligand_expr   = if (length(c_src) >= min_cells) .complex_expr(dat, lig_g, c_src) else NA_real_,
+      receptor_expr = if (length(c_tgt) >= min_cells) .complex_expr(dat, rec_g, c_tgt) else NA_real_,
+      stringsAsFactors = FALSE)
+  })
+  d <- dplyr::bind_rows(Filter(Negate(is.null), rows))
+  if (!nrow(d)) return(d)
+
+  dropped <- sum(is.na(d$ligand_expr) | is.na(d$receptor_expr))
+  if (dropped) message("  ", dropped, " donor(s) below min_cells = ", min_cells,
+                       " in one of the two cell types -> NA")
+
+  d %>%
+    dplyr::mutate(LR_score = ligand_expr * receptor_expr,
+                  Group    = grp_label(x, group),
+                  Group    = factor(Group, levels = c(x$cn$ref_label, x$cn$test_label)),
+                  edge     = sprintf("%s -> %s | %s - %s", source, target, ligand, receptor),
+                  Contrast = x$cn$label)
+}
+
+edge_stats <- function(x, ligand, receptor, source, target) {
+  comm <- safe_comm(x$merged, thresh = 1.01)
+  if (!nrow(comm)) return(NULL)
+  e <- comm[comm$ligand == ligand & comm$receptor == receptor &
+              as.character(comm$source) == source &
+              as.character(comm$target) == target, , drop = FALSE]
+  if (!nrow(e)) return(NULL)
+  arm <- function(a) {
+    r <- e[as.character(e$datasets) == a, , drop = FALSE]
+    if (!nrow(r)) c(prob = 0, pval = NA_real_)
+    else c(prob = r$prob[1], pval = r$pval[1])
+  }
+  a <- arm(x$cn$ref); b <- arm(x$cn$test)
+  nb <- cc_nboot_of(x)
+  list(prob_ref = unname(a["prob"]), prob_test = unname(b["prob"]),
+       p_ref = unname(a["pval"]),   p_test = unname(b["pval"]),
+       label = sprintf("CellChat: prob %s = %.3g (p = %.3g) | %s = %.3g (p = %.3g); nboot = %s",
+                       x$cn$ref_label,  unname(a["prob"]), unname(a["pval"]),
+                       x$cn$test_label, unname(b["prob"]), unname(b["pval"]),
+                       format(nb)))
+}
+
+validate_edge <- function(x, ligand, receptor, source, target,
+                          vd = NULL, seu_full = seu,
+                          min_cells = 10, sub = "12_validation",
+                          label = NULL) {
+  if (is.null(vd)) vd <- validation_data(x, seu_full)
+  d <- per_donor_edge(x, ligand, receptor, source, target, vd = vd,
+                      min_cells = min_cells)
+  if (!nrow(d)) { message("  validate_edge: no usable donors"); return(invisible(NULL)) }
+
+  test_one <- function(v) {
+    ok <- !is.na(v)
+    g  <- droplevels(d$Group[ok]); v <- v[ok]
+    if (nlevels(g) < 2 || any(table(g) < 2)) {
+      return(list(p_wilcox = NA_real_, p_t = NA_real_, n_ref = NA, n_test = NA,
+                  med_ref = NA_real_, med_test = NA_real_, p_min = NA_real_))
+    }
+    n <- as.integer(table(g))
+    list(
+      p_wilcox = tryCatch(stats::wilcox.test(v ~ g, exact = FALSE)$p.value,
+                          error = function(e) NA_real_),
+      p_t      = tryCatch(stats::t.test(v ~ g)$p.value, error = function(e) NA_real_),
+      n_ref = n[1], n_test = n[2],
+      med_ref  = stats::median(v[g == levels(g)[1]]),
+      med_test = stats::median(v[g == levels(g)[2]]),
+      p_min    = 2 / choose(sum(n), n[1]))
+  }
+  tests <- dplyr::bind_rows(lapply(
+    c(ligand_expr = "ligand_expr", receptor_expr = "receptor_expr", LR_score = "LR_score"),
+    function(cl) tibble::as_tibble(test_one(d[[cl]]))), .id = "Measure") %>%
+    dplyr::mutate(
+      Contrast = x$cn$label, edge = d$edge[1],
+      Direction = dplyr::case_when(is.na(med_test) | is.na(med_ref) ~ NA_character_,
+                                  med_test > med_ref ~ paste("higher in", x$cn$test_label),
+                                  med_test < med_ref ~ paste("higher in", x$cn$ref_label),
+                                  TRUE ~ "equal"),
+      n_donors_supporting = NA_integer_, .before = 1)
+
+  ref_med <- stats::median(d$LR_score[d$Group == levels(d$Group)[1]], na.rm = TRUE)
+  tests$n_donors_supporting[tests$Measure == "LR_score"] <-
+    sum(d$LR_score[d$Group == levels(d$Group)[2]] > ref_med, na.rm = TRUE)
+
+  tag <- gsub("[^A-Za-z0-9]+", "_",
+              if (is.null(label)) sprintf("%s_%s_%s_%s", source, target, ligand, receptor)
+              else label)
+  readr::write_csv(d,     out_file(x, sprintf("validate_%s_perDonor.csv", tag), sub))
+  readr::write_csv(tests, out_file(x, sprintf("validate_%s_tests.csv", tag), sub))
+
+  pd <- d %>%
+    tidyr::pivot_longer(c(ligand_expr, receptor_expr, LR_score),
+                        names_to = "Measure", values_to = "Value") %>%
+    dplyr::mutate(Measure = factor(Measure, levels = c("ligand_expr", "receptor_expr", "LR_score"),
+                                 labels = c(sprintf("Ligand %s\n(in %s)", ligand, source),
+                                            sprintf("Receptor %s\n(in %s)", receptor, target),
+                                            "L x R")))
+  es <- edge_stats(x, ligand, receptor, source, target)
+  lab_p <- tests %>%
+    dplyr::mutate(Measure = factor(Measure,
+      levels = c("ligand_expr", "receptor_expr", "LR_score"),
+      labels = levels(pd$Measure)),
+      lbl = sprintf("Wilcoxon p = %.3g | t p = %.3g", p_wilcox, p_t))
+
+  p <- ggplot(pd, aes(Group, Value, fill = Group)) +
+    geom_boxplot(outlier.shape = NA, width = 0.55, alpha = 0.5) +
+    geom_point(size = 2.6, position = position_jitter(width = 0.1, height = 0)) +
+    ggrepel::geom_text_repel(aes(label = donor), size = 2.4, colour = "grey30",
+                             max.overlaps = Inf, show.legend = FALSE) +
+    geom_text(data = lab_p, aes(label = lbl), x = -Inf, y = Inf, hjust = -0.05,
+              vjust = 1.4, size = 2.8, colour = "grey20", inherit.aes = FALSE) +
+    facet_wrap(~ Measure, scales = "free_y") +
+    scale_fill_manual(values = unname(GRP_COLS[c("ref", "test")]), guide = "none") +
+    labs(title = d$edge[1],
+         subtitle = paste(x$cn$label,
+                          if (!is.null(es)) paste0("\n", es$label) else ""),
+         x = NULL, y = sprintf("per donor (%s)", CC_MEAN_TYPE),
+         caption = sprintf("n = %d vs %d donors; smallest attainable Wilcoxon p: %s",
+                           tests$n_ref[3], tests$n_test[3],
+                           format(round(tests$p_min[3], 3)))) +
+    theme_minimal(base_size = 11) + cap_theme
+  ggsave(out_file(x, sprintf("validate_%s.png", tag), sub), p,
+         width = 9, height = 4.5, dpi = 300)
+
+  list(per_donor = d, tests = tests, plot = p)
+}
+
+validate_pathway <- function(x, pathway, top_n = 6, vd = NULL, seu_full = seu, ...) {
+  if (is.null(vd)) vd <- validation_data(x, seu_full)
+  comm <- safe_comm(x$merged, thresh = 1.01)
+  if (!nrow(comm)) return(invisible(NULL))
+  e <- comm[comm$pathway_name %in% pathway & !is.na(comm$prob) & comm$prob > 0, , drop = FALSE]
+  if (!nrow(e)) { message("  validate_pathway: '", pathway, "' not inferred"); return(invisible(NULL)) }
+  e <- e[order(-e$prob), , drop = FALSE]
+  e <- e[!duplicated(paste(e$source, e$target, e$ligand, e$receptor)), , drop = FALSE]
+  e <- utils::head(e, top_n)
+  message(x$cn$id, ": validating ", nrow(e), " edge(s) of ", pathway)
+  res <- lapply(seq_len(nrow(e)), function(i)
+    validate_edge(x, ligand = e$ligand[i], receptor = e$receptor[i],
+                  source = as.character(e$source[i]), target = as.character(e$target[i]),
+                  vd = vd, ...))
+  tests <- dplyr::bind_rows(lapply(res, function(r) if (is.null(r)) NULL else r$tests))
+  if (nrow(tests)) {
+    readr::write_csv(tests, out_file(x, sprintf("validate_%s_summary.csv",
+                                                gsub("[^A-Za-z0-9]+", "_", pathway)),
+                                     "12_validation"))
+  }
+  invisible(list(results = res, tests = tests))
+}
+```
+
+```{r cc-validate-run, eval=FALSE}
+vd_dx <- validation_data(CC$dx)
+validate_edge(CC$dx, ligand = "SPP1", receptor = "CD44",
+              source = "Myeloid Cells", target = "CD4+T-Cells", vd = vd_dx)
+validate_pathway(CC$dx,  "SPP1", top_n = 6, vd = vd_dx)
+validate_pathway(CC$sev, "SPP1", top_n = 6)
+```
+
+# Session info
+
+```{r session-info-06-cellchat}
+sessionInfo()
+```

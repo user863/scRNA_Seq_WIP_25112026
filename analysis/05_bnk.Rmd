@@ -1,0 +1,1080 @@
+---
+title: "xALD single-cell atlas -- Part 5: B and NK cells"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/05_bnk.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 10, dpi = 150)
+```
+
+# Part 5: B and NK cells
+
+## 5.1 Parameters
+
+```{r bnk-params}
+bnk_params <- list(
+  celltype_var   = "celltypes",
+  donor_var      = "patient_ID",
+  diagnosis_var  = "diagnosis",
+  resolutions    = c(0.4, 0.8, 1.2),
+  base_res       = 0.8,
+  seed           = 1
+)
+stopifnot(!is.null(path$graphs_bnk), !is.null(path$tables_bnk))
+```
+
+### 5.1.1 Lineage definitions
+
+```{r bnk-lineage-def}
+BNK_LINEAGES <- list(
+  B  = c("B-Cells", "Plasma-Cells", "Plasmablasts"),
+  NK = c("NK-Cells", "NK Cells")
+)
+
+BNK_LINEAGE_QC <- list(
+  B  = list(pos    = c("CD79A", "CD79B", "MS4A1", "CD19", "MZB1", "JCHAIN"),
+            contam = c("CD3D", "CD3E", "TRAC", "LYZ", "CD14", "PPBP")),
+  NK = list(pos    = c("KLRD1", "NKG7", "GNLY", "KLRF1", "TYROBP"),
+            contam = c("CD3D", "CD3E", "TRAC", "CD79A", "MS4A1", "LYZ", "CD14"))
+)
+```
+
+```{r bnk-helpers-check}
+bnk_need <- c("plot_clusters", "umap_compartment_figure", "dot_compartment_figure",
+              "store_figure_panels", "build_abundance_inputs", "fit_ab",
+              "plot_ab_figure", "run_ab_sev", "abundance_figure_panels", "ab_get_meta", "lineage_embed")
+bnk_missing_fns <- bnk_need[!vapply(bnk_need, exists, logical(1))]
+if (length(bnk_missing_fns))
+  stop("Part 5 needs ", toString(bnk_missing_fns), " -- source R/setup.R first.", call. = FALSE)
+```
+
+## 5.2 Marker panels
+
+```{r bnk-panels}
+bnk_ref_markers_B <- list(
+  "Lineage"        = c("CD79A", "CD79B", "MS4A1", "CD19", "BANK1"),
+  "Transitional"   = c("MME", "VPREB3", "SOX4", "IGLL5", "CD24", "CD38"),
+  "Naive"          = c("TCL1A", "IGHD", "IGHM", "FCER2", "IL4R", "CD72", "YBX3"),
+  "Memory"         = c("CD27", "TNFRSF13B", "AIM2", "CD1C", "COCH", "LTB"),
+  "Switched"       = c("IGHG1", "IGHG2", "IGHG3", "IGHA1"),
+  "Atypical / DN2" = c("ITGAX", "TBX21", "FCRL5", "FCRL3", "ZEB2", "FGR", "SCIMP"),
+  "Activated"      = c("CD69", "CD83", "NR4A1", "JUN", "EGR1", "MYC"),
+  "Plasmablast"    = c("MZB1", "XBP1", "JCHAIN", "PRDM1", "DERL3", "TNFRSF17", "SDC1"),
+  "Proliferating"  = c("MKI67", "TOP2A", "AICDA"),
+  "Contamination"  = c("CD3D", "TRAC", "LYZ", "CD14", "PPBP", "NKG7")
+)
+
+bnk_ref_markers_NK <- list(
+  "Lineage"        = c("KLRD1", "KLRF1", "NKG7", "GNLY", "TYROBP", "FCER1G", "NCR1"),
+  "CD56bright"     = c("NCAM1", "XCL1", "XCL2", "GZMK", "SELL", "IL7R", "TCF7", "CD44"),
+  "CD56dim"        = c("FCGR3A", "FGFBP2", "PRF1", "GZMB", "SPON2", "CX3CR1",
+                       "S1PR5", "ZEB2", "PLEK"),
+  "Adaptive"       = c("KLRC2", "B3GAT1", "IL32", "CD3E", "LAG3", "CD52"),
+  "Inhibitory"     = c("KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KIR2DL4", "LILRB1"),
+  "Residency"      = c("CD69", "ITGA1", "ITGAE", "CD160", "CXCR6", "RGS1"),
+  "ILC"            = c("KIT", "RORC", "KLRB1", "TNFRSF25", "AHR"),
+  "Proliferating"  = c("MKI67", "TOP2A"),
+  "Contamination"  = c("CD3D", "TRAC", "CD79A", "MS4A1", "LYZ", "CD14")
+)
+
+BNK_REF_MARKERS <- list(B = bnk_ref_markers_B, NK = bnk_ref_markers_NK)
+```
+
+## 5.3 Load and subset
+
+```{r bnk-cache-check}
+bnk_clustered_output <- file.path(path$objects, "08R_bnk_clustered.qs")
+bnk_output <- file.path(path$objects, "08R_bnk_cells_filtered_xALD.qs")
+bnk_force_recompute <- FALSE
+bnk_cached <- file.exists(bnk_output) && !bnk_force_recompute
+if (bnk_cached) bnk_filtered <- qread(bnk_output)
+```
+
+```{r bnk-load, eval = !bnk_cached}
+bnk_obj_list <- qread(file.path(path$objects, "03R_xALD_filtered_integrated.qs"))
+BNK_COMPARTMENTS <- names(bnk_obj_list)
+
+bnk_lvl <- sort(unique(unlist(lapply(bnk_obj_list, function(o)
+  as.character(o@meta.data[[bnk_params$celltype_var]])))))
+print(bnk_lvl)
+for (lin in names(BNK_LINEAGES))
+  if (!any(BNK_LINEAGES[[lin]] %in% bnk_lvl))
+    stop(lin, ": none of ", toString(BNK_LINEAGES[[lin]]), " in ", bnk_params$celltype_var, " -- adjust BNK_LINEAGES in 5.2.")
+
+bnk_spec <- expand.grid(lineage = names(BNK_LINEAGES), compartment = BNK_COMPARTMENTS,
+                        stringsAsFactors = FALSE)
+bnk_cells <- purrr::pmap(bnk_spec, function(lineage, compartment) {
+  o    <- bnk_obj_list[[compartment]]
+  keep <- o@meta.data[[bnk_params$celltype_var]] %in% BNK_LINEAGES[[lineage]]
+  o    <- subset(o, cells = colnames(o)[keep])
+  o$lineage     <- lineage
+  o$compartment <- compartment
+  o$orig_label  <- as.character(o@meta.data[[bnk_params$celltype_var]])
+  o
+}) |> setNames(sprintf("%s_%s", bnk_spec$lineage, bnk_spec$compartment))
+rm(bnk_obj_list); invisible(gc())
+sapply(bnk_cells, ncol)
+```
+
+## 5.4 Embedding and clustering
+
+```{r bnk-embed-cluster, eval = !bnk_cached}
+set.seed(42)
+bnk_cells <- lapply(bnk_cells, function(o)
+  lineage_cluster(lineage_embed(o), bnk_params$resolutions, bnk_params$base_res, bnk_params$seed))
+lapply(bnk_cells, function(o) table(o$seurat_clusters))
+qsave(bnk_cells, bnk_clustered_output)
+```
+
+```{r bnk-purity, eval = !bnk_cached}
+purrr::imap_dfr(bnk_cells, function(o, n) tibble(
+  subset     = n,
+  resolution = bnk_params$resolutions,
+  n_clusters = sapply(bnk_params$resolutions, function(r) dplyr::n_distinct(o[[lineage_res_col(r)]][, 1])),
+  purity     = sapply(bnk_params$resolutions, function(r) round(knn_purity(o, lineage_res_col(r)), 4)))) |>
+  kable_save("bnk_cluster_purity", dir = path$tables_bnk,
+             caption = "Clusters and kNN purity per subset and resolution")
+```
+
+```{r bnk-seed-stability, eval = !bnk_cached}
+purrr::imap_dfr(bnk_cells, function(so, nm)
+  lineage_seed_stability(so, bnk_params$base_res, bnk_params$seed) |> dplyr::mutate(subset = nm, .before = 1))
+```
+
+```{r bnk-cluster-umaps, fig.width = 7, fig.height = 6, eval = !bnk_cached}
+purrr::iwalk(bnk_cells, function(so, nm)
+  purrr::walk(bnk_params$resolutions, function(r) {
+    p <- plot_clusters(so, lineage_res_col(r)) + labs(subtitle = nm)
+    print(p)
+    ggsave(file.path(path$graphs_bnk, sprintf("bnk_clusters_%s_res%s.png", nm, r)),
+           p, width = 7, height = 6, dpi = 300)
+  }))
+```
+
+## 5.5 Cluster evidence
+
+```{r bnk-qc-figs, fig.width = 12, fig.height = 10, eval = !bnk_cached}
+bnk_batch_vars <- c(bnk_params$diagnosis_var, bnk_params$donor_var, "date_of_sequencing")
+
+purrr::iwalk(bnk_cells, function(obj, nm) {
+  p <- plot_qc_umap(obj, title = nm)
+  print(p)
+  ggsave(file.path(path$graphs_bnk, paste0("bnk_qc_umap_", tolower(nm), ".png")),
+         p, width = 12, height = 10, dpi = 300)
+
+  b <- patchwork::wrap_plots(lapply(intersect(bnk_batch_vars, colnames(obj[[]])), function(g)
+    DimPlot_scCustom(obj, group.by = g, reduction = "umap_harmony") + labs(subtitle = nm)),
+    ncol = 2)
+  print(b)
+  ggsave(file.path(path$graphs_bnk, paste0("bnk_batch_umap_", tolower(nm), ".png")),
+         b, width = 12, height = 10, dpi = 300)
+})
+```
+
+```{r bnk-cluster-markers, eval = !bnk_cached}
+bnk_markers <- purrr::imap(bnk_cells, function(o, nm) {
+  m <- top_markers_by_cluster(o)
+  readr::write_csv(m, file.path(path$tables_bnk, sprintf("bnk_markers_%s.csv", nm)))
+  m
+})
+
+bnk_markers$B_CSF  |> as.data.frame()
+bnk_markers$NK_CSF |> as.data.frame()
+```
+
+```{r bnk-cluster-evidence, eval = !bnk_cached}
+bnk_cluster_qc <- purrr::imap_dfr(bnk_cells, function(so, nm) {
+  lin <- unique(as.character(so$lineage))
+  cluster_evidence(so, genes = c(list(lineage_pos = BNK_LINEAGE_QC[[lin]]$pos), LINEAGE_EVIDENCE_GENES)) |>
+    dplyr::mutate(subset = nm, .before = 1)
+})
+bnk_cluster_qc |> dplyr::mutate(dplyr::across(where(is.double), ~ round(.x, 2))) |> print(n = Inf, width = Inf)
+```
+
+## 5.6 Labels
+
+```{r bnk-cluster-labels, eval = !bnk_cached}
+bnk_cluster_names <- list(
+  B_CSF   = c(
+  ),
+  B_PBMC  = c(
+  ),
+  NK_CSF  = c(
+  ),
+  NK_PBMC = c(
+  )
+)
+
+bnk_removed <- tibble::tribble(
+  ~subset, ~seurat_clusters, ~reason
+)
+
+check_cluster_map(bnk_cells, bnk_cluster_names, bnk_removed, key = "subset", complete = FALSE)
+
+bnk_removed |>
+  dplyr::left_join(bnk_cluster_qc, by = c("subset", "seurat_clusters")) |>
+  dplyr::mutate(dplyr::across(where(is.double), ~ round(.x, 3))) |>
+  readr::write_csv(file.path(path$tables_bnk, "bnk_cluster_review.csv"))
+```
+
+```{r bnk-apply-labels, eval = !bnk_cached}
+bnk_filtered <- purrr::imap(bnk_cells, function(o, nm) {
+  cl   <- as.character(o$seurat_clusters)
+  drop <- cl %in% bnk_removed$seurat_clusters[bnk_removed$subset == nm]
+  map  <- bnk_cluster_names[[nm]]
+  todo <- setdiff(unique(cl[!drop]), names(map))
+  if (length(todo)) {
+    warning("Part 5: label map for ", nm, " incomplete (no label for cluster(s) ",
+            toString(sort(todo)), ") -- using raw cluster IDs.", call. = FALSE)
+    o$celltype <- paste0("cl", cl)
+    o$labels_curated <- FALSE
+  } else {
+    o$celltype <- unname(map[cl])
+    o$labels_curated <- TRUE
+  }
+  message(nm, ": removed ", sum(drop), " cells")
+  if (any(drop)) o <- lineage_embed(subset(o, cells = colnames(o)[!drop]), neighbors = FALSE)
+  o
+})
+qsave(bnk_filtered, bnk_output)
+rm(bnk_cells); invisible(gc())
+```
+
+```{r bnk-celltype-counts}
+BNK_COMPARTMENTS <- unique(vapply(bnk_filtered, function(o)
+  unique(as.character(o$compartment)), character(1)))
+purrr::imap_dfr(bnk_filtered, function(o, nm)
+  tibble(subset = nm, curated = all(o$labels_curated),
+         celltype = names(table(o$celltype)), n_cells = as.integer(table(o$celltype)))) |>
+  kable_save("bnk_celltype_counts", dir = path$tables_bnk,
+             caption = "Cells per B/NK label and subset")
+```
+
+### 5.6.1 Objects per lineage
+
+```{r bnk-by-lineage}
+bnk_filtered <- add_severity(bnk_filtered)
+bnk_by_lineage <- lapply(setNames(names(BNK_LINEAGES), names(BNK_LINEAGES)), function(lin) {
+  x <- bnk_filtered[grep(paste0("^", lin, "_"), names(bnk_filtered))]
+  setNames(x, sub(paste0("^", lin, "_"), "", names(x)))
+})
+BNK_LINEAGE_TITLE <- c(B = "B cells", NK = "NK cells")
+BNK_FIG_LEVEL     <- c(B = "bcells", NK = "nkcells")
+lapply(bnk_by_lineage, function(x) sapply(x, ncol))
+```
+
+## 5.7 Marker validation
+
+```{r bnk-dotplots, fig.width = 12, fig.height = 6}
+bnk_validation_dots <- purrr::imap(bnk_by_lineage, function(objs, lin)
+  dot_compartment_figure(objs, features = list(), label_col = "celltype",
+                         stem = paste0("bnk_marker_validation_", tolower(lin)),
+                         umap_fig = get0("bnk_umap_figs")[[lin]],
+                         extra = BNK_REF_MARKERS[[lin]], dir = path$graphs_bnk))
+for (d in unlist(bnk_validation_dots, recursive = FALSE)) print(d$figure)
+```
+
+```{r bnk-panel-coverage}
+purrr::imap_dfr(bnk_filtered, function(o, nm) {
+  lin <- unique(as.character(o$lineage))
+  g   <- unique(unlist(BNK_REF_MARKERS[[lin]], use.names = FALSE))
+  tibble(subset = nm, missing = paste(setdiff(g, rownames(o)), collapse = ", "))
+}) |>
+  kable_save("bnk_panel_coverage", dir = path$tables_bnk,
+             caption = "Marker-panel genes absent from the assay")
+```
+
+## 5.8 Main figures
+
+### 5.8.1 Labelled UMAP panels [CORE]
+
+```{r bnk-umap-panels}
+bnk_umap_figs <- purrr::imap(bnk_by_lineage, function(objs, lin) {
+  f <- umap_compartment_figure(objs, label_col = "celltype",
+                               stem = paste0("bnk_umap_", tolower(lin), "_panels"),
+                               level_title = BNK_LINEAGE_TITLE[[lin]],
+                               dir = path$graphs_bnk)
+  print(f$figure)
+  store_figure_panels(BNK_FIG_LEVEL[[lin]], "umap", f)
+  f
+})
+```
+
+### 5.8.2 Marker dot plots [CORE]
+
+```{r bnk-dot-panels}
+bnk_dot_markers <- list(
+  B = list(
+    "Transitional"  = c("MME", "VPREB3"),
+    "Naive"         = c("TCL1A", "IGHD", "FCER2"),
+    "Memory"        = c("CD27", "TNFRSF13B"),
+    "Switched"      = c("IGHG1", "IGHA1"),
+    "Atypical"      = c("ITGAX", "TBX21", "FCRL5"),
+    "Activated"     = c("CD69", "CD83"),
+    "Plasmablast"   = c("MZB1", "JCHAIN", "PRDM1"),
+    "Plasma cell"   = c("SDC1", "TNFRSF17")),
+  NK = list(
+    "CD56bright"    = c("NCAM1", "XCL1", "GZMK"),
+    "CD56dim"       = c("FCGR3A", "FGFBP2", "CX3CR1"),
+    "Adaptive"      = c("KLRC2", "B3GAT1"),
+    "Proliferating" = c("MKI67", "TOP2A"),
+    "ILC"           = c("KIT", "RORC")))
+BNK_DOT_EXTRA <- list(B  = list(Lineage = c("CD79A", "MS4A1", "CD19")),
+                      NK = list(Lineage = c("KLRD1", "NKG7", "GNLY")))
+
+bnk_dots <- purrr::imap(bnk_by_lineage, function(objs, lin) {
+  d <- dot_compartment_figure(objs, bnk_dot_markers[[lin]], "celltype",
+                              stem = paste0("bnk_dot_", tolower(lin)),
+                              umap_fig = bnk_umap_figs[[lin]],
+                              extra = BNK_DOT_EXTRA[[lin]], dir = path$graphs_bnk)
+  for (x in d) print(x$figure)
+  store_figure_panels(BNK_FIG_LEVEL[[lin]], "dots", d)
+  d
+})
+```
+
+## 5.9 Composition
+
+### 5.9.1 Differential abundance (edgeR, NB + offset)
+
+```{r bnk-da-config}
+BNK_AB_MIN_DONORS_PER_GROUP <- 2
+
+par_ab_bnk <- list(
+  label_col       = "celltype",
+  donor_col       = "sample_key",
+  group_col       = bnk_params$diagnosis_var,
+  compartment_col = "compartment",
+  strat_col       = "severity_active",
+  ref_group       = "control",
+  min_cells       = 5,
+  min_samples     = 0.5,
+  fdr             = 0.05,
+  ext_totals      = NULL)
+```
+
+```{r bnk-da-fit, fig.width = 12, fig.height = 6}
+bnk_meta <- lapply(bnk_by_lineage, ab_get_meta, compartment_col = par_ab_bnk$compartment_col)
+
+bnk_ab <- purrr::imap(bnk_by_lineage, function(objs, lin) {
+  out <- list()
+  for (comp in names(objs)) {
+    ab <- tryCatch(build_abundance_inputs(
+      bnk_meta[[lin]], compartment_col = par_ab_bnk$compartment_col, focus = comp,
+      donor_col = par_ab_bnk$donor_col, group_col = par_ab_bnk$group_col,
+      label_col = par_ab_bnk$label_col, strat_col = par_ab_bnk$strat_col,
+      ref_group = par_ab_bnk$ref_group, min_cells = par_ab_bnk$min_cells,
+      min_samples = par_ab_bnk$min_samples, ext_totals = par_ab_bnk$ext_totals),
+      error = function(e) { message(lin, "/", comp, ": ", conditionMessage(e)); NULL })
+    if (is.null(ab)) next
+    n_grp <- table(droplevels(ab$sinfo$group))
+    if (length(n_grp) < 2 || any(n_grp < BNK_AB_MIN_DONORS_PER_GROUP) || nrow(ab$mat) < 2) {
+      message(lin, "/", comp, ": ", paste(sprintf("%s=%d", names(n_grp), n_grp), collapse = ", "),
+              " donors, ", nrow(ab$mat), " cell types -- skipped"); next
+    }
+    design <- model.matrix(~ group, data = ab$sinfo)
+    colnames(design) <- make.names(colnames(design))
+    res <- fit_ab(ab$mat, ab$sinfo, ab$totals, design,
+                  coef = setdiff(colnames(design), "X.Intercept.")[1], fdr = par_ab_bnk$fdr) |>
+      dplyr::arrange(FDR) |>
+      dplyr::mutate(lineage = lin, compartment = comp, contrast = "xALD_vs_ctrl",
+                    n_ref = as.integer(n_grp[[par_ab_bnk$ref_group]]),
+                    n_test = as.integer(sum(n_grp) - n_grp[[par_ab_bnk$ref_group]]),
+                    .before = 1)
+
+    kable_save(tibble::rownames_to_column(as.data.frame(cbind(ab$mat, total = ab$totals)), "celltype"),
+               sprintf("bnk_da_counts_%s_%s", tolower(lin), comp), dir = path$tables_bnk,
+               caption = sprintf("%s, %s: cells per donor", BNK_LINEAGE_TITLE[[lin]], comp)) |>
+      print()
+    cmp <- ab_compositional(ab, res) %>% dplyr::mutate(lineage = lin, compartment = comp, .before = 1)
+    fig <- ab_res_for_figure(res, cmp)
+    print(plot_ab_figure(
+      ab$long, fig$res, ab$totals,
+      pal = umap_palette_for(bnk_umap_figs[[lin]], comp, ab$long$celltype),
+      title_a = "Per-donor composition", title_b_prefix = paste0("X-ALD vs control, ", fig$method),
+      y_lab = sprintf("proportion of %s %s", comp, BNK_LINEAGE_TITLE[[lin]]),
+      fdr = par_ab_bnk$fdr, x_lab = fig$x_lab, ci_label = fig$ci_label,
+      out_file = file.path(path$graphs_bnk,
+                           sprintf("bnk_da_%s_%s_%s.png", fig$method, tolower(lin), comp))))
+    out[[comp]] <- list(inputs = ab, res = res, comp = cmp, res_fig = fig$res,
+                        method = fig$method, x_lab = fig$x_lab)
+  }
+  if (length(out))
+    store_figure_panels(BNK_FIG_LEVEL[[lin]], "abundance", abundance_figure_panels(
+      out, umap_fig = bnk_umap_figs[[lin]], ref_group = par_ab_bnk$ref_group,
+      contrast = "X-ALD vs control", fdr = par_ab_bnk$fdr,
+      y_lab = paste("proportion of", BNK_LINEAGE_TITLE[[lin]])))
+  out
+})
+
+bnk_da_res <- dplyr::bind_rows(lapply(bnk_ab, function(l) dplyr::bind_rows(lapply(l, `[[`, "res"))))
+readr::write_csv(bnk_da_res, file.path(path$tables_bnk, "bnk_da_edger_all.csv"))
+kable_save(
+  dplyr::select(bnk_da_res, lineage, compartment, celltype,
+                logFC, ci_lo, ci_hi, PValue, FDR, n_ref, n_test),
+  "bnk_da_edger_summary", dir = path$tables_bnk,
+  digits = 3, caption = "X-ALD vs control: log2 FC in proportion")
+```
+
+### 5.9.2 Compositional check
+
+```{r bnk-da-compositional}
+comp_bnk <- dplyr::bind_rows(lapply(bnk_ab, function(l) dplyr::bind_rows(lapply(l, `[[`, "comp"))))
+readr::write_csv(comp_bnk, file.path(path$tables_bnk, "bnk_da_compositional.csv"))
+knitr::kable(comp_bnk, digits = 3, caption = "B and NK cells, X-ALD vs control: share vs compositional tests")
+```
+
+### 5.9.3 Stage 3 vs stages 1-2, within X-ALD
+
+```{r bnk-da-sev, fig.width = 11, fig.height = 5}
+bnk_ab_sev <- purrr::imap(bnk_by_lineage, function(objs, lin)
+  run_ab_sev(bnk_meta[[lin]], par_ab_bnk, names(objs), tag = paste0("bnk_", tolower(lin)),
+             ext_totals = par_ab_bnk$ext_totals, fig = bnk_umap_figs[[lin]],
+             fig_dir = path$graphs_bnk, tab_dir = path$tables_bnk))
+```
+
+### 5.9.4 Composition by severity stage
+
+```{r bnk-ab-by-severity, fig.width = 9, fig.height = 6}
+purrr::iwalk(bnk_meta, function(m, lin)
+  print(plot_ab_by_severity(m, "celltype", title = paste(BNK_LINEAGE_TITLE[[lin]], "by severity stage"),
+                            umap_fig = bnk_umap_figs[[lin]],
+                            out_file = file.path(path$graphs_bnk, sprintf("bnk_abundance_by_severity_%s.png", tolower(lin))))))
+```
+
+### 5.9.5 CSF vs PBMC, paired donors
+
+```{r bnk-paired, fig.width = 12, fig.height = 7}
+bnk_paired <- purrr::imap(bnk_by_lineage, function(objs, lin) {
+  x <- ab_paired_compartment(objs, "celltype")
+  if (is.null(x)) return(NULL)
+  print(knitr::kable(x$res %>% dplyr::mutate(dplyr::across(c(median_CSF, median_PBMC), ~ round(100 * .x, 2)),
+                                             log2OR = round(log2OR, 2)) %>%
+                       dplyr::select(celltype, `%CSF` = median_CSF, `%PBMC` = median_PBMC, log2OR, p.value, padj),
+                     digits = 4, caption = paste(BNK_LINEAGE_TITLE[[lin]], ": CSF vs PBMC")))
+  print(x$propeller)
+  readr::write_csv(x$by_dx, file.path(path$tables_bnk, sprintf("bnk_csf_vs_pbmc_%s.csv", tolower(lin))))
+  p <- plot_ab_paired(x, what = BNK_LINEAGE_TITLE[[lin]], stem = sprintf("bnk_csf_vs_pbmc_%s", tolower(lin)),
+                      dir = path$graphs_bnk)
+  print(p$forest); print(p$pairs)
+  x
+})
+```
+
+## 5.10 Pseudobulk DEG (DESeq2)
+
+```{r bnk-deg-constants}
+MIN_CELLS_SAMPLE <- DEG_MIN_CELLS_PER_SAMPLE
+MIN_CELLS_SUBSET <- DEG_MIN_CELLS
+PADJ_T           <- DEG_PADJ_THRESH
+LFC_T            <- DEG_LFC_THRESH
+MASK_CLASSES     <- DEG_MASK_CLASSES
+```
+
+### 5.10.1 Families
+
+```{r bnk-deg-meta}
+bnk_DEG <- lapply(bnk_by_lineage, function(x) lapply(x, function(so) { so$sev_grp <- sev_group3(so$severity); so }))
+
+bnk_units <- unlist(lapply(names(bnk_DEG), function(lin) {
+  u <- deg_loo_units(bnk_DEG[[lin]], names(bnk_DEG[[lin]]), paste0("all_", lin), "celltype",
+                     min_cells = MIN_CELLS_SUBSET)
+  lapply(u, function(x) { if (x$level == "celltype") x$level <- paste0("celltype_", lin); x })
+}), recursive = FALSE)
+
+donors_in_fit <- function(meta, by) colSums(table(meta$patient_ID, interaction(meta[by], drop = TRUE)) >= MIN_CELLS_SAMPLE)
+lapply(bnk_DEG, function(x) lapply(x, function(so) donors_in_fit(so@meta.data, "sev_grp")))
+purrr::map_dfr(bnk_units, ~ tibble(tissue = .x$tissue, level = .x$level, subset = .x$subset))
+```
+
+### 5.10.2 Fits
+
+```{r bnk-deg-run}
+deg_label_of <- function(x) {
+  lab <- unlist(c(deg_contrast_labels, if (exists("DEG_SEVERITY_LABELS")) DEG_SEVERITY_LABELS))
+  out <- unname(lab[x]); out[is.na(out)] <- x[is.na(out)]
+  stats::setNames(as.list(out), x)
+}
+
+deg_all_bnk <- dplyr::bind_rows(lapply(bnk_units, function(u) {
+  message(u$tissue, " / ", u$level, " / ", u$subset)
+  flatten_contrasts(run_all_contrasts(u$get()), u$tissue, u$level, u$subset)
+}))
+deg_all_bnk <- collect_deg_results(deg_all_bnk, csv_prefix = file.path(path$tables, "DEG_bnk"))
+contrast_labels <- deg_label_of(sort(unique(deg_all_bnk$comparison)))
+
+deg_all_bnk %>%
+  dplyr::filter(status == "ok") %>%
+  dplyr::group_by(tissue, level, subset, comparison) %>%
+  dplyr::summarise(genes_tested = dplyr::n(),
+                   sig      = sum(deg_is_sig(padj, log2FC, PADJ_T, LFC_T), na.rm = TRUE),
+                   sig_main = sum(deg_is_sig(padj, log2FC, PADJ_T, LFC_T) & !gene_class %in% MASK_CLASSES, na.rm = TRUE),
+                   .groups = "drop") %>%
+  kable_save("DEG_bnk_inventory", dir = path$tables_bnk, caption = "B/NK DEG families: genes tested and significant")
+```
+
+### 5.10.3 Volcano plots and DEG counts
+
+```{r bnk-deg-volcano, fig.width = 8, fig.height = 7}
+deg_headline_bnk <- deg_all_bnk %>% dplyr::filter(status == "ok", !gene_class %in% MASK_CLASSES)
+sev_note <- function(cmp) if (is_sev3_comparison(cmp)) SEV_CONFOUND_NOTE else NULL
+
+fam_key <- with(deg_headline_bnk, paste(tissue, level, subset, comparison, sep = "|"))
+for (df in split(deg_headline_bnk, fam_key, drop = TRUE)) {
+  if (nrow(df) < 5) next
+  ti <- df$tissue[1]; lv <- df$level[1]; ss <- df$subset[1]; cmp <- as.character(df$comparison[1])
+  p <- plot_volcano(df, title = paste(ti, "-", lv, ss, "-", contrast_labels[[cmp]]),
+                    lfc_col = "log2FC", padj_col = "padj", gene_col = "gene", subtitle = sev_note(cmp))
+  print(p)
+  ggsave(file.path(path$graphs_bnk, paste0("volcano_", lv, "_", ti, "_", sanitize(ss), "_", cmp, ".png")),
+         p, width = 8, height = 7, dpi = 300)
+}
+```
+
+```{r bnk-deg-summary, fig.width = 7, fig.height = 6}
+for (lv in paste0("celltype_", names(BNK_LINEAGES))) {
+  for (ti in BNK_COMPARTMENTS) {
+    for (cmp in names(contrast_labels)) {
+      df <- dplyr::filter(deg_headline_bnk, tissue == ti, level == lv, comparison == cmp)
+      if (nrow(df) < 5) next
+      p <- plot_deg_summary(df, group_col_name = "subset", title = paste(ti, "-", lv, "-", contrast_labels[[cmp]]),
+                            lfc_col = "log2FC", padj_col = "padj", subtitle = sev_note(cmp))
+      print(p)
+      ggsave(file.path(path$graphs_bnk, paste0("deg_summary_", lv, "_", ti, "_", cmp, ".png")),
+             p, width = 7, height = 6, dpi = 300)
+    }
+  }
+}
+```
+
+## 5.11 Gene sets and TF activity
+
+```{r bnk-gs-inputs}
+GS_CONTRASTS_BNK <- LINEAGE_GS_CONTRASTS
+GS_LEVELS_BNK    <- unique(deg_all_bnk$level)
+miss <- setdiff(GS_CONTRASTS_BNK, unique(deg_all_bnk$comparison[deg_all_bnk$status == "ok"]))
+if (length(miss)) warning("not fitted in deg_all_bnk: ", toString(miss))
+cov_bnk <- lineage_covariates(bnk_filtered)
+```
+
+### 5.11.1 Global-shift diagnostics
+
+```{r bnk-gs-shift-diagnostics, fig.width = 7.2, fig.height = 6}
+shift_bnk_report <- purrr::imap(bnk_by_lineage, function(objs, lin)
+  gs_shift_report(deg_all_bnk, objs, GS_CONTRASTS_BNK, paste0(c("all_", "celltype_"), lin), paste0("all_", lin),
+                  "celltype", paste0("bnk_", tolower(lin)), path$graphs_bnk))
+```
+
+### 5.11.2 Gene-set tests
+
+```{r bnk-gs-run}
+gs_universe_bnk <- unique(deg_all_bnk$gene[deg_all_bnk$status == "ok"])
+gs_bnk <- gs_assemble(gs_universe_bnk)
+kable_save(gs_bnk$provenance %>% dplyr::arrange(panel, set), "geneset_provenance_bnk",
+           caption = "B/NK cells: gene sets, size, genes among the tested genes")
+
+gs_res_bnk_all <- gs_run(deg_all_bnk, gs_bnk$sets, GS_CONTRASTS_BNK, levels_use = GS_LEVELS_BNK)
+readr::write_csv(gs_res_bnk_all, file.path(path$tables, "geneset_bnk_all_rankings.csv"))
+
+gs_reg_bnk     <- gs_registry_from_units(bnk_units)
+gs_reg_bnk_sev <- gs_registry_severity(bnk_units, setdiff(GS_CONTRASTS_BNK, "xALD_vs_ctrl"))
+gs_voom_bnk    <- dplyr::bind_rows(gs_run_voom(gs_reg_bnk, gs_bnk$sets), gs_run_voom(gs_reg_bnk_sev, gs_bnk$sets))
+invisible(gc())
+
+gs_res_bnk <- gs_finalise(gs_res_bnk_all, gs_bnk$provenance, gs_voom_bnk)
+gs_res_bnk$shift_robust <- suppressWarnings(gs_shift_robust(gs_res_bnk))
+readr::write_csv(gs_res_bnk, file.path(path$tables, "geneset_bnk.csv"))
+
+shift_bnk <- gs_shift_diagnostics(deg_all_bnk, GS_CONTRASTS_BNK, GS_LEVELS_BNK, gs_res_bnk_all)
+kable_save(shift_bnk, "geneset_bnk_shift_diagnostics", digits = 3,
+           caption = "B/NK cells: global-shift diagnostics per family, gene and set level, with verdict")
+
+gs_res_bnk %>%
+  dplyr::filter(agree, panel != "control") %>%
+  dplyr::arrange(comparison, tissue, level, subset, padj_camera_vc_est, padj_fgsea) %>%
+  dplyr::select(comparison, tissue, level, subset, set, inference, tier, NES, dplyr::any_of(c(
+    "mean_logFC", "corr_camera_vc_est", "padj_camera_vc_est", "padj_fry", "fry_sig", "padj_camera_vc")),
+    padj_fgsea, padj_camera, dplyr::any_of(c("robust_matched", "robust_intensity")),
+    global_shift_flag, ieg_flag, leading_edge) %>%
+  kable_save("geneset_bnk_significant", digits = 3,
+             caption = "B/NK cells: significant sets (donor-level call where available, else gene-level screen)")
+```
+
+### 5.11.3 Figures
+
+```{r bnk-gs-figure, fig.width = 7.2, fig.height = 6}
+GS_FIG_GROUPS_BNK <- list(dx = "xALD_vs_ctrl", severity = DEG_SEV_REPORT)
+for (lin in names(BNK_LINEAGES)) for (gn in names(GS_FIG_GROUPS_BNK)) {
+  d <- gs_res_bnk %>% dplyr::filter(comparison %in% GS_FIG_GROUPS_BNK[[gn]],
+                                    level %in% paste0(c("all_", "celltype_"), lin))
+  if (!nrow(d)) next
+  p <- gs_plot_dots(d, gs_bnk$provenance,
+    title = paste0(BNK_LINEAGE_TITLE[[lin]], " gene sets, ", if (gn == "dx") "X-ALD vs control" else "severity",
+                   " (NES; ring = significant, column agree)"))
+  print(p)
+  save_umap_fig(p, paste0("geneset_bnk_dots_", tolower(lin), if (gn != "dx") paste0("_", gn)), path$graphs_bnk,
+                width_mm = FIG_WIDTH_MM[["double"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(3.2 * length(unique(d$set)) + 45)))
+}
+```
+
+### 5.11.4 Transcription-factor activity
+
+```{r bnk-tf, fig.width = 7.2, fig.height = 5}
+if (!exists("tf_net") || is.null(tf_net))
+  tf_net <- tryCatch(tf_get_network(), error = function(e) {
+    warning("TF network unavailable: ", conditionMessage(e), call. = FALSE); NULL })
+tf_res_bnk <- NULL
+if (!is.null(tf_net)) {
+  tf_res_bnk <- tf_run(deg_all_bnk, tf_net, GS_CONTRASTS_BNK, levels_use = GS_LEVELS_BNK)
+  readr::write_csv(tf_res_bnk, file.path(path$tables, "tf_activity_bnk.csv"))
+  p_tf_bnk <- tf_plot_heatmap(tf_res_bnk, intersect(TF_OF_INTEREST, tf_res_bnk$tf),
+                              title = paste0("B/NK transcription-factor activity (",
+                                             attr(tf_net, "network") %||% "network", ", ulm)"))
+  print(p_tf_bnk)
+  save_umap_fig(p_tf_bnk, "tf_activity_bnk", path$graphs_bnk,
+                width_mm = FIG_WIDTH_MM[["onehalf"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(3.4 * length(TF_OF_INTEREST) + 40)))
+}
+```
+
+### 5.11.5 Per-donor set scores
+
+```{r bnk-gs-donor, fig.width = 7.2, fig.height = 6}
+gs_score_sets_bnk <- gs_bnk$sets[gs_bnk$provenance$set[gs_bnk$provenance$source != "regex over tested genes"]]
+gs_donor_bnk <- purrr::imap_dfr(bnk_by_lineage, function(objs, lin)
+  gs_donor_scores(objs, gs_score_sets_bnk, "celltype") %>% dplyr::mutate(celltype = paste0(lin, ": ", celltype))) %>%
+  dplyr::left_join(cov_bnk, by = "donor")
+readr::write_csv(gs_donor_bnk, file.path(path$tables, "geneset_bnk_donor_scores.csv"))
+donor_assoc_bnk <- gs_donor_associations(gs_donor_bnk)
+readr::write_csv(donor_assoc_bnk, file.path(path$tables, "geneset_bnk_donor_associations.csv"))
+
+GS_DONOR_SHOW_BNK <- intersect(gs_current_names(c("SREBP2_TARGETS_CORE", "SREBF1_LIPOGENIC", "LXR_TARGETS",
+                                 "VLCFA_PEROXISOME", "GC_RESPONSE_CANONICAL",
+                                 "IEG_DISSOCIATION_STRESS")), names(gs_score_sets_bnk))
+p_donor_bnk <- gs_donor_bnk %>%
+  dplyr::filter(tissue == "CSF", set %in% GS_DONOR_SHOW_BNK, !is.na(sev_grp)) %>%
+  dplyr::mutate(set = factor(set, levels = GS_DONOR_SHOW_BNK),
+                hydrocortisone = ifelse(is.na(hydrocortisone), "NA", as.character(hydrocortisone))) %>%
+  ggplot2::ggplot(ggplot2::aes(sev_grp, score, colour = sev_grp)) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey85", linewidth = FIG_LINE_MM) +
+  ggplot2::geom_point(ggplot2::aes(shape = hydrocortisone), size = 1.2,
+                      position = ggplot2::position_jitter(width = 0.12, height = 0, seed = 1)) +
+  ggplot2::stat_summary(fun = stats::median, fun.min = stats::median, fun.max = stats::median,
+                        geom = "crossbar", width = 0.5, linewidth = FIG_LINE_MM, colour = "black") +
+  ggplot2::scale_colour_manual(values = SEV_GROUP3_COLS, guide = "none") +
+  ggplot2::scale_x_discrete(labels = SEV_GROUP3_LABELS) +
+  ggplot2::facet_grid(set ~ celltype) +
+  ggplot2::labs(x = NULL, y = "Per-donor set score (mean z)", shape = "Hydrocortisone",
+                title = "CSF B and NK cells: per-donor set scores") +
+  gs_theme() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                 strip.text.y = ggplot2::element_text(angle = 0, hjust = 0))
+print(p_donor_bnk)
+save_umap_fig(p_donor_bnk, "geneset_bnk_donor_scores_CSF", path$graphs_bnk,
+              width_mm = FIG_WIDTH_MM[["double"]], height_mm = min(FIG_MAX_DEPTH_MM, 28 * length(GS_DONOR_SHOW_BNK) + 30))
+```
+
+### 5.11.6 Treatment confounding check
+
+```{r bnk-confound}
+gs_treatment_check(gs_res_bnk, gs_bnk, tf_res_bnk, donor_assoc_bnk, "bnk")
+```
+
+## 5.12 Leave-one-donor-out: DEG and gene sets
+
+```{r bnk-loo, cache = FALSE, error = FALSE}
+loo_bnk <- deg_loo_run(Filter(function(u) u$tissue %in% DEG_LOO_TISSUES, bnk_units), deg_all_bnk, "bnk")
+loo_gs_bnk <- gs_loo_voom(c(gs_reg_bnk, gs_reg_bnk_sev), gs_bnk$sets, gs_res_bnk)
+
+fam_bnk <- loo_bnk$families
+if (!is.null(fam_bnk)) {
+  if (!any(fam_bnk$status == "ok")) stop("LOO: no family could be fit")
+  stale <- dplyr::filter(fam_bnk, sig_match %in% FALSE)
+  if (nrow(stale))
+    stop("deg_all_bnk is stale for ", nrow(stale), " families: ",
+         paste(stale$tissue, stale$level, stale$subset, stale$comparison, sep = "/", collapse = "; "),
+         " -- rerun DEG before LOO")
+  readr::write_csv(fam_bnk, file.path(path$tables, "DEG_bnk_loo_families.csv"))
+}
+readr::write_csv(loo_bnk$genes, file.path(path$tables, "DEG_bnk_loo_genes.csv"))
+readr::write_csv(loo_bnk$folds, file.path(path$tables, "DEG_bnk_loo_folds.csv"))
+
+loo_sum_bnk <- deg_loo_summary(loo_bnk$genes)
+kable_save(loo_sum_bnk, "DEG_bnk_loo_summary", digits = 3,
+           caption = "B/NK DEG: share of significant genes that stay significant when one donor is removed")
+deg_all_bnk <- collect_deg_results(loo_annotate(deg_all_bnk, loo_bnk$genes, "gene"),
+                                   csv_prefix = file.path(path$tables, "DEG_bnk"))
+
+gs_res_bnk <- loo_annotate(gs_res_bnk, loo_gs_bnk, "set")
+readr::write_csv(gs_res_bnk, file.path(path$tables, "geneset_bnk.csv"))
+kable_save(deg_loo_summary(loo_gs_bnk), "geneset_bnk_loo_summary", digits = 3,
+           caption = "B/NK gene sets: share of significant sets retained when one donor is removed")
+```
+
+## 5.13 Intrathecal Ig production
+
+```{r bnk-ig-setup}
+ISOTYPE_GENES <- list(
+  IgM = "IGHM", IgD = "IGHD",
+  IgG = c("IGHG1", "IGHG2", "IGHG3", "IGHG4"),
+  IgA = c("IGHA1", "IGHA2"), IgE = "IGHE")
+LIGHT_GENES <- list(kappa = "IGKC",
+                    lambda = c("IGLC1", "IGLC2", "IGLC3", "IGLC7"))
+
+ig_counts <- function(obj, sets) {
+  cts <- LayerData(obj, assay = "RNA", layer = "counts")
+  out <- sapply(sets, function(g) {
+    g <- intersect(g, rownames(cts))
+    if (!length(g)) return(rep(0, ncol(cts)))
+    Matrix::colSums(cts[g, , drop = FALSE])
+  })
+  matrix(out, nrow = ncol(cts), dimnames = list(colnames(cts), names(sets)))
+}
+
+assign_isotype <- function(obj, min_counts = 10, min_frac = 0.6) {
+  m   <- ig_counts(obj, ISOTYPE_GENES)
+  tot <- rowSums(m)
+  top <- max.col(m, ties.method = "first")
+  frac <- ifelse(tot > 0, m[cbind(seq_len(nrow(m)), top)] / tot, NA_real_)
+  ok  <- tot >= min_counts & !is.na(frac) & frac >= min_frac
+
+  lm_ <- ig_counts(obj, LIGHT_GENES)
+  lt  <- rowSums(lm_)
+
+  obj$ig_total     <- tot
+  obj$ig_frac_top  <- frac
+  obj$isotype      <- ifelse(ok, colnames(m)[top], NA_character_)
+  obj$light_total  <- lt
+  obj$light_chain  <- ifelse(lt >= min_counts,
+                             ifelse(lm_[, "kappa"] > lm_[, "lambda"], "kappa", "lambda"),
+                             NA_character_)
+  obj
+}
+
+bnk_ig <- lapply(bnk_filtered, assign_isotype)
+
+BNK_COMPS  <- BNK_COMPARTMENTS
+BNK_DON_RE <- paste0("_(", paste(BNK_COMPS, collapse = "|"), ")$")
+
+PB_PATTERN    <- "Plasmablast|Plasma"
+NAIVE_PATTERN <- "Naive|Transitional|B-Cell"
+
+ig_label_col <- function(o) {
+  for (cl in c("celltype", "orig_label")) {
+    v <- if (cl %in% colnames(o[[]])) as.character(o[[cl, drop = TRUE]]) else NULL
+    if (!is.null(v) && any(grepl(paste(PB_PATTERN, NAIVE_PATTERN, sep = "|"), v)))
+      return(cl)
+  }
+  NA_character_
+}
+
+ig_labels_of <- function(o) {
+  cl <- ig_label_col(o)
+  if (is.na(cl)) rep(NA_character_, ncol(o)) else as.character(o[[cl, drop = TRUE]])
+}
+
+bnk_lab_cols <- vapply(bnk_ig[grep("^B_", names(bnk_ig))], ig_label_col, character(1))
+message("Label column per B subset: ",
+        paste(sprintf("%s=%s", names(bnk_lab_cols), bnk_lab_cols), collapse = ", "))
+```
+
+#### Ambient control
+
+```{r bnk-ig-ambient}
+purrr::imap_dfr(bnk_ig, function(o, nm) tibble(
+  subset        = nm,
+  lineage       = unique(as.character(o$lineage)),
+  n_cells       = ncol(o),
+  ig_median     = stats::median(o$ig_total),
+  ig_q90        = stats::quantile(o$ig_total, 0.9),
+  pct_over_10   = round(100 * mean(o$ig_total >= 10), 1),
+  pct_assigned  = round(100 * mean(!is.na(o$isotype)), 1))) |>
+  dplyr::arrange(lineage) |>
+  kable_save("bnk_ig_ambient", dir = path$tables_bnk, digits = 1,
+             caption = "Ig counts per cell; NK cells give the ambient floor")
+```
+
+#### Readout 1 - isotype distribution, CSF vs blood of the same donor
+
+```{r bnk-ig-isotype, fig.width = 10, fig.height = 5}
+IG_MIN_ASSIGNED <- 10
+
+isotype_long <- purrr::imap_dfr(bnk_ig[grep("^B_", names(bnk_ig))], function(o, nm) {
+  tibble(compartment = unique(as.character(o$compartment)),
+         donor_raw   = as.character(o[[bnk_params$donor_var, drop = TRUE]]),
+         group       = as.character(o[[bnk_params$diagnosis_var, drop = TRUE]]),
+         isotype     = o$isotype)
+}) |>
+  dplyr::mutate(donor = sub(BNK_DON_RE, "", donor_raw)) |>
+  dplyr::filter(!is.na(isotype)) |>
+  dplyr::count(compartment, donor, group, isotype, name = "n") |>
+  tidyr::complete(tidyr::nesting(compartment, donor, group),
+                  isotype = names(ISOTYPE_GENES), fill = list(n = 0)) |>
+  dplyr::group_by(compartment, donor) |>
+  dplyr::mutate(n_donor = sum(n), pct = 100 * n / n_donor) |>
+  dplyr::ungroup()
+
+isotype_yield <- isotype_long |>
+  dplyr::distinct(compartment, donor, group, n_donor) |>
+  dplyr::arrange(compartment, dplyr::desc(n_donor))
+cat("Assigned B cells per donor x compartment",
+    sprintf("(threshold %d):\n", IG_MIN_ASSIGNED))
+print(as.data.frame(isotype_yield))
+cat(sprintf("  above threshold: %d of %d\n",
+            sum(isotype_yield$n_donor >= IG_MIN_ASSIGNED), nrow(isotype_yield)))
+
+isotype_tab <- dplyr::filter(isotype_long, n_donor >= IG_MIN_ASSIGNED)
+readr::write_csv(isotype_tab, file.path(path$tables_bnk, "bnk_ig_isotype_per_donor.csv"))
+
+bnk_comps_ok <- sort(unique(isotype_tab$compartment))
+isotype_paired <- NULL
+
+if (!nrow(isotype_tab)) {
+  message("Readout 1: no donor reaches ", IG_MIN_ASSIGNED,
+          " assigned B cells. In order: (1) check ig-ambient -- does the ",
+          "assignment hold at all? (2) lower IG_MIN_ASSIGNED and report the ",
+          "uncertainty; (3) loosen min_counts/min_frac in assign_isotype(), ",
+          "which lets ambient signal in.")
+} else if (length(bnk_comps_ok) < 2) {
+  message("Readout 1: only compartment '", bnk_comps_ok,
+          "' clears the threshold -- no paired comparison possible. Report ",
+          "this rather than working around it.")
+} else {
+  bnk_csf_comp <- if ("CSF" %in% bnk_comps_ok) "CSF" else bnk_comps_ok[1]
+  bnk_ref_comp <- setdiff(bnk_comps_ok, bnk_csf_comp)[1]
+
+  bnk_wide <- isotype_tab |>
+    dplyr::select(donor, group, isotype, compartment, pct) |>
+    tidyr::pivot_wider(names_from = compartment, values_from = pct) |>
+    dplyr::filter(!is.na(.data[[bnk_csf_comp]]), !is.na(.data[[bnk_ref_comp]]))
+
+  if (!nrow(bnk_wide)) {
+    message("Readout 1: no donor has BOTH compartments above the threshold ",
+            "-- no paired test possible.")
+  } else {
+    isotype_paired <- bnk_wide |>
+      dplyr::mutate(.csf = .data[[bnk_csf_comp]], .ref = .data[[bnk_ref_comp]]) |>
+      dplyr::group_by(group, isotype) |>
+      dplyr::summarise(
+        n_pairs  = dplyr::n(),
+        med_CSF  = stats::median(.csf), med_ref = stats::median(.ref),
+        delta    = stats::median(.csf - .ref),
+        p_paired = if (dplyr::n() >= 4)
+          suppressWarnings(stats::wilcox.test(.csf, .ref, paired = TRUE)$p.value)
+          else NA_real_,
+        .groups = "drop") |>
+      dplyr::mutate(padj = p.adjust(p_paired, "BH"),
+                    comparison = paste(bnk_csf_comp, "vs", bnk_ref_comp)) |>
+      dplyr::arrange(group, p_paired)
+    print(as.data.frame(isotype_paired))
+    readr::write_csv(isotype_paired,
+                     file.path(path$tables_bnk, "bnk_ig_isotype_paired.csv"))
+  }
+}
+
+if (nrow(isotype_tab)) {
+p_bnk_iso <- ggplot(isotype_tab, aes(compartment, pct, group = donor)) +
+  geom_line(colour = "grey70", linewidth = 0.4) +
+  geom_point(aes(colour = group), size = 2) +
+  facet_grid(group ~ isotype) +
+  scale_colour_manual(values = c(control = "grey45", `X-ALD` = "#B2182B"), name = NULL) +
+  labs(y = "% of isotype-assigned B cells", x = NULL,
+       title = "Isotype distribution, paired CSF vs blood",
+       subtitle = "One line = one donor; discordance = not a passive blood sample") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank())
+print(p_bnk_iso)
+ggsave(file.path(path$graphs_bnk, "bnk_ig_isotype_paired.pdf"), p_bnk_iso, width = 10, height = 5)
+}
+readr::write_csv(isotype_yield, file.path(path$tables_bnk, "bnk_ig_isotype_yield.csv"))
+```
+
+#### Readout 2 - enrichment index
+
+```{r bnk-ig-index, fig.width = 7, fig.height = 5}
+ig_long <- purrr::imap_dfr(bnk_ig[grep("^B_", names(bnk_ig))], function(o, nm) {
+  cl <- bnk_lab_cols[[nm]]
+  if (is.na(cl)) { message("  ", nm, ": no label vocabulary recognised"); return(NULL) }
+  tibble(compartment = unique(as.character(o$compartment)),
+         donor_raw   = as.character(o[[bnk_params$donor_var, drop = TRUE]]),
+         group       = as.character(o[[bnk_params$diagnosis_var, drop = TRUE]]),
+         label       = as.character(o[[cl, drop = TRUE]]))
+})
+
+if (!is.null(ig_long) && nrow(ig_long)) {
+  ig_long <- ig_long |>
+    dplyr::mutate(donor = sub(BNK_DON_RE, "", donor_raw),
+                  class = dplyr::case_when(
+                    grepl(PB_PATTERN, label)    ~ "PB",
+                    grepl(NAIVE_PATTERN, label) ~ "naive",
+                    TRUE ~ NA_character_))
+  cat("Label -> class:\n")
+  print(as.data.frame(dplyr::count(ig_long, label, class, name = "n_cells")))
+}
+
+ig_index <- NULL
+if (is.null(ig_long) || !nrow(ig_long) || !any(ig_long$class %in% "PB")) {
+  message("Readout 2: no cell matches PB_PATTERN ('", PB_PATTERN, "'). The ",
+          "table above lists the labels present -- adjust PB_PATTERN/",
+          "NAIVE_PATTERN, or curate 5.8.2.")
+} else {
+  bnk_per_donor <- ig_long |>
+    dplyr::filter(!is.na(class)) |>
+    dplyr::count(compartment, donor, group, class, name = "n") |>
+    tidyr::complete(tidyr::nesting(compartment, donor, group),
+                    class = c("PB", "naive"), fill = list(n = 0)) |>
+    tidyr::pivot_wider(names_from = class, values_from = n, values_fill = 0)
+  for (k in c("PB", "naive")) if (!k %in% names(bnk_per_donor)) bnk_per_donor[[k]] <- 0L
+
+  bnk_per_donor <- bnk_per_donor |>
+    dplyr::mutate(ratio = (PB + 0.5) / (naive + 0.5))
+  cat("\nCell counts per donor x compartment:\n")
+  print(as.data.frame(dplyr::arrange(bnk_per_donor, compartment, donor)))
+
+  bnk_comps_ok <- sort(unique(bnk_per_donor$compartment))
+  if (length(bnk_comps_ok) < 2) {
+    message("Readout 2: only compartment '", bnk_comps_ok,
+            "' present -- the index is a CSF/blood ratio and needs both.")
+  } else {
+    bnk_csf_comp <- if ("CSF" %in% bnk_comps_ok) "CSF" else bnk_comps_ok[1]
+    bnk_ref_comp <- setdiff(bnk_comps_ok, bnk_csf_comp)[1]
+
+    bnk_wide <- bnk_per_donor |>
+      dplyr::select(donor, group, compartment, ratio, PB, naive) |>
+      tidyr::pivot_wider(names_from = compartment,
+                         values_from = c(ratio, PB, naive))
+    rc <- paste0("ratio_", bnk_csf_comp); rr <- paste0("ratio_", bnk_ref_comp)
+    if (!all(c(rc, rr) %in% names(bnk_wide))) {
+      message("Readout 2: columns ", rc, "/", rr, " missing -- no pair.")
+    } else {
+      ig_index <- bnk_wide |>
+        dplyr::filter(!is.na(.data[[rc]]), !is.na(.data[[rr]])) |>
+        dplyr::mutate(index = log2(.data[[rc]] / .data[[rr]]),
+                      comparison = paste(bnk_csf_comp, "vs", bnk_ref_comp)) |>
+        dplyr::arrange(dplyr::desc(index))
+      if (!nrow(ig_index)) {
+        message("Readout 2: no donor with both compartments.")
+        ig_index <- NULL
+      }
+    }
+  }
+}
+
+if (!is.null(ig_index)) print(as.data.frame(ig_index))
+if (!is.null(ig_index))
+  readr::write_csv(ig_index, file.path(path$tables_bnk, "bnk_ig_enrichment_index.csv"))
+
+if (!is.null(ig_index) && nrow(ig_index) >= 4) {
+  print(stats::wilcox.test(index ~ group, data = ig_index))
+  for (g in unique(ig_index$group)) {
+    v <- ig_index$index[ig_index$group == g]
+    if (length(v) >= 4)
+      cat(sprintf("%s: median index %.2f, Wilcoxon vs 0 p = %.3f (n = %d)\n",
+                  g, stats::median(v),
+                  suppressWarnings(stats::wilcox.test(v, mu = 0)$p.value), length(v)))
+  }
+}
+
+if (!is.null(ig_index) && nrow(ig_index)) {
+p_bnk_index <- ggplot(ig_index, aes(group, index, colour = group)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey55") +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.2) +
+  geom_point(size = 2.6, position = position_jitter(width = 0.08, seed = 1)) +
+  scale_colour_manual(values = c(control = "grey45", `X-ALD` = "#B2182B"), guide = "none") +
+  labs(x = NULL, y = expression(log[2]~"(PB/naive)"[CSF]~"/"~"(PB/naive)"[blood]),
+       title = "Plasmablast enrichment in CSF",
+       subtitle = "> 0: enriched beyond general B-cell traffic") +
+  theme_classic(base_size = 11)
+print(p_bnk_index)
+ggsave(file.path(path$graphs_bnk, "bnk_ig_enrichment_index.pdf"), p_bnk_index, width = 7, height = 5)
+}
+```
+
+#### Readouts 3 and 4 - in-situ maturation and light-chain restriction
+
+```{r bnk-ig-insitu}
+bnk_insitu <- purrr::imap_dfr(bnk_ig[grep("^B_", names(bnk_ig))], function(o, nm) {
+  pb <- grepl(PB_PATTERN, ig_labels_of(o))
+  pb[is.na(pb)] <- FALSE
+  if (!any(pb)) { message("  ", nm, ": no cell matches PB_PATTERN"); return(NULL) }
+  cts <- LayerData(o, assay = "RNA", layer = "counts")[, pb, drop = FALSE]
+  g   <- function(x) intersect(x, rownames(cts))
+  tibble(
+    subset      = nm,
+    compartment = unique(as.character(o$compartment)),
+    group       = as.character(o[[bnk_params$diagnosis_var, drop = TRUE]])[pb],
+    prolif      = Matrix::colSums(cts[g(c("MKI67", "TOP2A")), , drop = FALSE]) > 0,
+    aicda       = Matrix::colSums(cts[g("AICDA"), , drop = FALSE]) > 0)
+})
+
+if (!nrow(bnk_insitu) || !all(c("compartment", "group") %in% names(bnk_insitu))) {
+  message("Readout 3: no plasmablasts found (PB_PATTERN = '", PB_PATTERN,
+          "'). The label -> class table in readout 2 shows the vocabulary.")
+} else {
+  bnk_insitu <- bnk_insitu |>
+    dplyr::group_by(compartment, group) |>
+    dplyr::summarise(n_PB = dplyr::n(),
+                     pct_prolif = round(100 * mean(prolif), 1),
+                     pct_aicda  = round(100 * mean(aicda), 1), .groups = "drop")
+  print(as.data.frame(bnk_insitu))
+  readr::write_csv(bnk_insitu, file.path(path$tables_bnk, "bnk_ig_insitu_plasmablasts.csv"))
+}
+
+bnk_light <- purrr::imap_dfr(bnk_ig[grep("^B_", names(bnk_ig))], function(o, nm) {
+  keep <- !is.na(o$light_chain) & grepl(PB_PATTERN, ig_labels_of(o))
+  keep[is.na(keep)] <- FALSE
+  if (!any(keep)) return(NULL)
+  tibble(compartment = unique(as.character(o$compartment)),
+         donor = sub(BNK_DON_RE, "",
+                     as.character(o[[bnk_params$donor_var, drop = TRUE]])[keep]),
+         group = as.character(o[[bnk_params$diagnosis_var, drop = TRUE]])[keep],
+         lc    = o$light_chain[keep])
+})
+
+if (!nrow(bnk_light) || !all(c("compartment", "donor") %in% names(bnk_light))) {
+  message("Readout 4: no plasmablasts with an assigned bnk_light chain.")
+} else {
+  bnk_light <- bnk_light |>
+    dplyr::count(compartment, donor, group, lc) |>
+    tidyr::pivot_wider(names_from = lc, values_from = n, values_fill = 0)
+  for (k in c("kappa", "lambda")) if (!k %in% names(bnk_light)) bnk_light[[k]] <- 0L
+  bnk_light <- bnk_light |>
+    dplyr::mutate(n_PB = kappa + lambda,
+                  pct_kappa = round(100 * kappa / n_PB, 1)) |>
+    dplyr::filter(n_PB >= 10) |>
+    dplyr::arrange(dplyr::desc(abs(pct_kappa - 60)))
+  if (!nrow(bnk_light)) {
+    message("Readout 4: no donor with >= 10 plasmablasts -- no kappa/lambda ratio.")
+  } else {
+    print(as.data.frame(bnk_light))
+    readr::write_csv(bnk_light, file.path(path$tables_bnk, "bnk_ig_light_chain.csv"))
+  }
+}
+```
+
+## 5.14 Save
+
+```{r bnk-save}
+bnk_annotated_output <- file.path(path$objects, "08R_bnk_cells_annotated_xALD.qs")
+qsave(bnk_filtered, bnk_annotated_output)
+
+```
+
+# Session info
+
+```{r session-info-05-bnk}
+sessionInfo()
+```

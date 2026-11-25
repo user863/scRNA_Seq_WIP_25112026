@@ -1,0 +1,852 @@
+---
+title: "xALD single-cell atlas -- Part 3: Myeloid cells"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/03_myeloid.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 10, dpi = 150)
+```
+
+# Part 3: Myeloid cells
+
+## 3.1 Parameters
+
+```{r mc-params}
+mc_params <- list(
+  resolutions = c(0.6, 0.8, 1.6, 2.4),
+  base_res    = c(CSF = 2.4, PBMC = 0.8),
+  seed        = c(CSF = 1, PBMC = 1)
+)
+```
+
+## 3.2 Marker panels
+
+```{r mc-panels}
+myeloidmarkers1 <- c(
+  "S100A8", "CD14", "VCAN", "ISG15", "IFI44L", "IFI44", "CDKN1C",
+  "FCGR3A", "TCF7L2", "CXCR2", "FCGR3B", "G0S2", "FLT3", "C1orf54",
+  "CLEC9A", "DNASE1L3", "FCGR2B", "FCER1A", "CD1C", "CD1E", "RGS1", "CD8A")
+myeloidmarkers2 <- c(
+  "LYVE1", "P2RY12", "AREG", "VMO1", "P2RY14", "FCN1", "CD36", "ACY3", "S100B", "KIT",
+  "PPP1R14A", "AXL", "SIGLEC6", "CCR7", "BIRC3", "LAMP3", "TREM2", "GPNMB", "SPP1",
+  "SLC2A5", "CH25H", "SPARC", "APOE", "CD74", "HLA-DRA", "HLA-DPB1")
+myeloidmarkers3 <- c(
+  "C1QA", "C1QB", "MRC1", "CD163", "CD9", "LPL",
+  "MKI67", "TOP2A",
+  "CD3E", "TRAC", "NKG7", "CD79A", "PPBP", "HBB")
+```
+
+## 3.3 Load and subset
+
+```{r myeloid-cache-check}
+myeloid_clustered_output <- file.path(path$objects, "04R_myeloidCells_integrated_clustered.qs")
+myeloid_output <- file.path(path$objects, "05R_myeloidCells_xALD.qs")
+myeloid_force_recompute <- FALSE
+myeloid_cached <- file.exists(myeloid_output) && !myeloid_force_recompute
+
+if (myeloid_cached) {
+  myeloidcells_filtered <- qread(myeloid_output)
+  message("loaded ", myeloid_output, " (written ", format(file.info(myeloid_output)$mtime), ")")
+  for (cmp in names(myeloidcells_filtered)) {
+    dd <- unique(myeloidcells_filtered[[cmp]]@meta.data[, c("patient_ID", "diagnosis")])
+    message("  ", cmp, ": ", nrow(dd), " donors -- ",
+            paste(sprintf("%s=%d", names(table(dd$diagnosis)), table(dd$diagnosis)), collapse = ", "))
+  }
+}
+```
+
+```{r, eval=!myeloid_cached}
+xALD_filtered <- qread(file.path(path$objects, "03R_xALD_filtered_integrated.qs"))
+table(unique(xALD_filtered[[1]]@meta.data[, c("patient_ID", "diagnosis")])$diagnosis)
+```
+
+```{r, eval=!myeloid_cached}
+myeloidcells <- lapply(xALD_filtered, function(so) subset(so, subset = celltypes %in% "Myeloid Cells"))
+rm(xALD_filtered); invisible(gc())
+```
+
+## 3.4 Embedding and clustering
+
+### 3.4.1 Elbow plot
+
+```{r, eval=!myeloid_cached}
+wrap_plots(lapply(names(myeloidcells), function(x) ElbowPlot(myeloidcells[[x]], ndims = 50) + ggtitle(x)),
+           ncol = 2)
+```
+
+### 3.4.2 Embedding and clustering
+
+```{r, eval=!myeloid_cached}
+set.seed(42)
+myeloidcells <- imap(myeloidcells, function(so, ti)
+  lineage_cluster(lineage_embed(so), mc_params$resolutions, mc_params$base_res[[ti]], mc_params$seed[[ti]]))
+lapply(myeloidcells, function(so) table(so$seurat_clusters))
+qsave(myeloidcells, myeloid_clustered_output)
+```
+
+```{r mc-seed-stability, eval=!myeloid_cached}
+purrr::imap_dfr(myeloidcells, function(so, ti)
+  lineage_seed_stability(so, mc_params$base_res[[ti]], mc_params$seed[[ti]]) %>% mutate(tissue = ti, .before = 1))
+```
+
+### 3.4.3 Cluster UMAPs
+
+```{r, eval=!myeloid_cached}
+for (ti in names(myeloidcells)) for (col in lineage_res_col(mc_params$resolutions))
+  print(plot_clusters(myeloidcells[[ti]], col) + labs(subtitle = ti))
+```
+
+## 3.5 Cluster evidence
+
+```{r, eval=!myeloid_cached}
+for (ti in names(myeloidcells)) {
+  so <- myeloidcells[[ti]]
+  for (g in c("diagnosis", "patient_ID", "date_of_sequencing"))
+    print(DimPlot_scCustom(so, group.by = g, reduction = "umap_harmony") + labs(subtitle = ti))
+  print(plot_qc_umap(so, title = ti))
+}
+```
+
+### 3.5.1 Cluster markers
+
+```{r, eval=!myeloid_cached}
+top_markers_mc <- lapply(myeloidcells, top_markers_by_cluster)
+top_markers_mc
+```
+
+### 3.5.2 Marker dot plots per cluster
+
+```{r, eval=!myeloid_cached}
+for (comp in c("CSF", "PBMC")) for (mk in list(myeloidmarkers1, myeloidmarkers2, myeloidmarkers3)) {
+  print(DotPlot(myeloidcells[[comp]], features = intersect(mk, rownames(myeloidcells[[comp]])),
+                group.by = "seurat_clusters") +
+    scale_color_gradientn(colors = dotplot_gradient, name = "Mean expression\nin group") +
+    labs(title = comp, x = NULL, y = NULL, size = "Fraction of cells\nin group (%)") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"),
+          axis.text.y = element_text(size = 9), plot.title = element_text(face = "bold"),
+          legend.position = "bottom") +
+    coord_flip())
+}
+```
+
+### 3.5.3 Evidence table
+
+```{r, eval=!myeloid_cached}
+mc_cluster_qc <- imap_dfr(myeloidcells, function(so, ti) cluster_evidence(so) %>% mutate(tissue = ti, .before = 1))
+mc_cluster_qc %>% mutate(across(where(is.double), ~ round(.x, 2))) %>% print(n = Inf, width = Inf)
+```
+
+## 3.6 Labels
+
+```{r mc-cluster-labels, eval=!myeloid_cached}
+cluster_names <- list(
+  CSF = c(
+  ),
+  PBMC = c(
+  )
+)
+
+mc_removed <- tibble::tribble(
+  ~tissue, ~seurat_clusters, ~reason
+)
+
+check_cluster_map(myeloidcells, cluster_names, mc_removed)
+
+mc_removed %>%
+  left_join(mc_cluster_qc, by = c("tissue", "seurat_clusters")) %>%
+  mutate(across(where(is.double), ~ round(.x, 3))) %>%
+  write_csv(file.path(path$tables, "myeloid_cluster_review.csv"))
+```
+
+```{r, eval=!myeloid_cached}
+myeloidcells_filtered <- imap(myeloidcells, function(so, ti) apply_cluster_map(so, cluster_names[[ti]], "celltype_mc"))
+rm(myeloidcells); invisible(gc())
+qsave(myeloidcells_filtered, myeloid_output)
+```
+
+### 3.6.1 Checks
+
+```{r}
+lapply(myeloidcells_filtered, function(so) table(so$celltype_mc))
+
+if ("Proliferating myeloid" %in% myeloidcells_filtered$CSF$celltype_mc) {
+  myeloidcells_filtered$CSF@meta.data %>%
+    group_by(patient_ID, diagnosis) %>%
+    summarise(n = n(), prolif = sum(celltype_mc == "Proliferating myeloid"), share = prolif / n, .groups = "drop") %>%
+    arrange(diagnosis, desc(share))
+}
+
+imap(myeloidcells_filtered, ~ DimPlot_scCustom(.x, group.by = "celltype_mc", reduction = "umap_harmony", label = TRUE) + ggtitle(.y))
+```
+
+### 3.6.2 Severity stage
+
+```{r myeloid-severity}
+myeloidcells_filtered <- lapply(add_severity(myeloidcells_filtered), function(so) {
+  so$sev_grp <- sev_group3(so$severity); so })
+myeloidcells_DEG <- myeloidcells_filtered
+severity_report(myeloidcells_DEG, "myeloid")
+```
+
+## 3.7 Marker validation
+
+```{r}
+myeloidmarkers_PBMC <- c(
+   "CD1E", "CD1C", "FCER1A", "AREG", "CCR2",
+  "CD1D", "CLEC10A", "PPP1R14A", "HLA-DPB1",
+  "FLT3", "CLNK", "S100B", "CADM1", "CLEC9A", "XCR1", "SLAMF7",
+  "TCF7L2", "LGALS3",
+  "CD36", "FCGR3A",
+  "CCL2", "IFIT1", "IFIT3", "ISG15", "IFI44L",
+  "S100A9", "S100A8", "VCAN", "FCN1"
+)
+
+myeloidmarkers_CSF <- c(
+   "CD1E", "CD1C", "FCER1A", "AREG", "CCR2",
+  "CD1D", "CLEC10A", "SIGLEC6", "ACY3", "PPP1R14A", "HLA-DPB1",
+  "FLT3", "CLNK", "S100B", "CADM1", "P2RY12", "TREM2", "CD74",  "CLEC9A",
+  "TCF7L2", "AXL", "LYVE1", "CD163", "SIGLEC1", "MRC1",
+  "GPNMB", "SPP1", "LGALS3", "CH25H",
+  "CD36", "FCGR3A",
+  "CCL2", "IFIT1", "IFIT3", "ISG15", "IFI44L",
+  "S100A9", "S100A8", "VCAN", "FCN1"
+)
+
+celltype_order <- c(  "CD14-Monocytes",  "Lipid-associated Macrophages",
+  "BAM",  "cDC2"
+)
+celltype_order_PBMC <-  c("CD14-Monocytes", "IFN-Monocytes",
+  "CD16+ Monocytes","cDC1", "cDC2"
+)
+order_present <- function(ord, so) { have <- unique(as.character(so$celltype_mc)); c(intersect(ord, have), sort(setdiff(have, ord))) }
+
+order_csf <- order_present(celltype_order, myeloidcells_filtered[["CSF"]])
+plot_marker_dotplot(
+  myeloidcells_filtered[["CSF"]], myeloidmarkers_CSF, "celltype_mc",
+  title = "CSF", order = order_csf,
+  order_labels = unname(c(
+    "Lipid-associated Macrophages"      = "Lipid-associated\nmacrophages",
+    "BAM"= "Border-associated\nmacrophage (BAM)",
+    setNames(order_csf, order_csf))[order_csf]))
+ggsave(file.path(path$graphs_myeloid, "dotplot_MC_Cluster_markergenes_CSF.png"), width = 5, height = 12, dpi = 300)
+
+plot_marker_dotplot(
+  myeloidcells_filtered[["PBMC"]], myeloidmarkers_PBMC, "celltype_mc",
+  title = "PBMC", order = order_present(celltype_order_PBMC, myeloidcells_filtered[["PBMC"]]))
+ggsave(file.path(path$graphs_myeloid, "dotplot_MC_Cluster_markergenes_PBMC.png"), width = 5, height = 12, dpi = 300)
+```
+
+### 3.7.1 Diagnosis on the UMAP
+
+```{r}
+for (comp in c("CSF", "PBMC")) {
+  print(DimPlot_scCustom(myeloidcells_filtered[[comp]], group.by = "diagnosis", reduction = "umap_harmony"))
+  ggsave(file.path(path$graphs_myeloid, paste0("DimPlot_MC_Cluster_diagnosis_", comp, ".png")), width = 5, height = 12, dpi = 300)
+}
+```
+
+## 3.8 Main figures
+
+### 3.8.1 Labelled UMAP panels
+
+```{r umap-panels-myeloid}
+fig_mc_umap <- umap_compartment_figure(myeloidcells_filtered, label_col = "celltype_mc",
+                                       stem = "umap_myeloid_panels",
+                                       level_title = "myeloid cells",
+                                       dir = path$graphs_myeloid)
+print(fig_mc_umap$figure)
+store_figure_panels("myeloid", "umap", fig_mc_umap)
+```
+
+### 3.8.2 Marker dot plots
+
+```{r dot-panels-myeloid}
+dot_markers_mc <- list(
+  "CD14-Monocytes"               = c("CD14", "S100A8", "VCAN"),
+  "Monocytes"                    = c("CD14", "S100A8", "VCAN"),
+  "IFN-Monocytes"                = c("ISG15", "IFIT3", "IFI44L"),
+  "CD16+ Monocytes"              = c("FCGR3A", "CDKN1C"),
+  "BAM"                          = c("LYVE1", "MRC1", "CD163"),
+  "Lipid-associated Macrophages" = c("GPNMB", "SPP1", "LGALS3", "CH25H", "CCL3"),
+  "tissue associated macrophages" = c("C1QA", "C1QB", "APOE"),
+  "Proliferating myeloid"        = c("MKI67", "TOP2A"),
+  "cDC2"                         = c("CD1C", "FCER1A", "CLEC10A"),
+  "cDC1"                         = c("CLEC9A", "XCR1", "CADM1"))
+
+dots_mc <- dot_compartment_figure(myeloidcells_filtered, dot_markers_mc, "celltype_mc",
+                                  stem = "dot_myeloid", umap_fig = fig_mc_umap,
+                                  dir = path$graphs_myeloid)
+for (d in dots_mc) print(d$figure)
+store_figure_panels("myeloid", "dots", dots_mc)
+```
+
+## 3.9 Composition
+
+### 3.9.1 Differential abundance (edgeR, NB with log total offset)
+
+```{r myeloid-ab, fig.width = 11, fig.height = 5}
+par_ab_mc <- list(
+  label_col       = "celltype_mc",
+  donor_col       = "patient_ID",
+  group_col       = "diagnosis",
+  compartment_col = "compartment",
+  strat_col       = "severity_active",
+  ref_group       = "control",
+  min_cells       = 5,
+  min_samples     = 0.5,
+  fdr             = 0.05)
+meta_all_mc <- ab_get_meta(myeloidcells_filtered, par_ab_mc$compartment_col)
+
+ab_mc <- list()
+for (ti in c("CSF", "PBMC")) {
+  ab <- build_abundance_inputs(
+    meta_all_mc, compartment_col = par_ab_mc$compartment_col, focus = ti,
+    donor_col = par_ab_mc$donor_col, group_col = par_ab_mc$group_col,
+    label_col = par_ab_mc$label_col, strat_col = par_ab_mc$strat_col,
+    ref_group = par_ab_mc$ref_group, min_cells = par_ab_mc$min_cells,
+    min_samples = par_ab_mc$min_samples)
+  design <- model.matrix(~ group, data = ab$sinfo)
+  colnames(design) <- make.names(colnames(design))
+  res <- fit_ab(ab$mat, ab$sinfo, ab$totals, design,
+                coef = setdiff(colnames(design), "X.Intercept.")[1], fdr = par_ab_mc$fdr)
+  print(knitr::kable(res %>% arrange(FDR) %>% select(celltype, logFC, ci_lo, ci_hi, PValue, FDR), digits = 3,
+                     caption = paste("X-ALD vs control,", ti, "— log2 FC in myeloid sub-type proportion")))
+  comp <- ab_compositional(ab, res) %>% dplyr::mutate(tissue = ti, .before = 1)
+  fig  <- ab_res_for_figure(res, comp)
+  print(plot_ab_figure(
+    ab$long, fig$res, ab$totals, pal = umap_palette_for(fig_mc_umap, ti, ab$long$celltype),
+    title_a = paste0("Per-donor composition (", ti, " myeloid)"),
+    title_b_prefix = paste0("X-ALD vs control, ", fig$method),
+    y_lab = paste("proportion of", ti, "myeloid cells"),
+    fdr = par_ab_mc$fdr, x_lab = fig$x_lab, ci_label = fig$ci_label,
+    out_file = file.path(path$graphs_myeloid, paste0("myeloid_per_donor_", fig$method, "_", ti, ".png"))))
+  ab_mc[[ti]] <- list(inputs = ab, res = res, comp = comp, res_fig = fig$res, method = fig$method, x_lab = fig$x_lab)
+}
+
+store_figure_panels("myeloid", "abundance", abundance_figure_panels(
+  ab_mc, umap_fig = fig_mc_umap, ref_group = par_ab_mc$ref_group,
+  contrast = "X-ALD vs control", fdr = par_ab_mc$fdr, y_lab = "proportion of myeloid cells"))
+```
+
+### 3.9.2 Compositional check
+
+```{r myeloid-ab-compositional}
+comp_mc <- dplyr::bind_rows(lapply(ab_mc, `[[`, "comp"))
+readr::write_csv(comp_mc, file.path(path$tables, "abundance_myeloid_compositional.csv"))
+knitr::kable(comp_mc, digits = 3, caption = "Myeloid, X-ALD vs control: share vs compositional tests")
+```
+
+### 3.9.3 Stage 3 vs stages 1-2, within X-ALD
+
+```{r myeloid-ab-sev, fig.width = 11, fig.height = 5}
+ab_mc_sev <- run_ab_sev(meta_all_mc, par_ab_mc, c("CSF", "PBMC"), tag = "myeloid",
+                        fig = fig_mc_umap, fig_dir = path$graphs_myeloid)
+```
+
+### 3.9.4 Composition by severity stage
+
+```{r myeloid-ab-by-severity, fig.width = 9, fig.height = 6}
+plot_ab_by_severity(meta_all_mc, "celltype_mc", title = "Myeloid cells by severity stage", umap_fig = fig_mc_umap,
+                    out_file = file.path(path$graphs_myeloid, "myeloid_abundance_by_severity.png"))
+```
+
+### 3.9.5 CSF vs PBMC, paired donors
+
+```{r myeloid-paired, fig.width = 12, fig.height = 7}
+paired_mc <- ab_paired_compartment(myeloidcells_filtered, "celltype_mc")
+knitr::kable(paired_mc$res %>% mutate(across(c(median_CSF, median_PBMC), ~ round(100 * .x, 2)), log2OR = round(log2OR, 2)) %>%
+               select(celltype, `%CSF` = median_CSF, `%PBMC` = median_PBMC, log2OR, p.value, padj), digits = 4)
+paired_mc$propeller
+readr::write_csv(paired_mc$by_dx, file.path(path$tables, "abundance_myeloid_csf_vs_pbmc.csv"))
+p_paired_mc <- plot_ab_paired(paired_mc, what = "myeloid cells", stem = "myeloid_csf_vs_pbmc", dir = path$graphs_myeloid)
+p_paired_mc$forest; p_paired_mc$pairs
+```
+
+### 3.9.6 Per-donor composition
+
+```{r}
+donor_pct <- purrr::imap_dfr(myeloidcells_filtered, function(so, tissue)
+  so@meta.data %>% select(patient_ID, diagnosis, celltype_mc, sev_grp, severity_active) %>% mutate(tissue = tissue)) %>%
+  group_by(tissue, patient_ID, diagnosis, sev_grp, severity_active, celltype_mc) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(tissue, patient_ID) %>%
+  mutate(total = sum(n), proportion = n / total) %>%
+  ungroup()
+```
+
+#### 3.9.6.1 Per-donor and per-group bar charts
+
+```{r}
+donor_pct_sev <- donor_pct %>% filter(!is.na(sev_grp)) %>%
+  mutate(group = factor(SEV_GROUP3_LABELS[as.character(sev_grp)], levels = SEV_GROUP3_LABELS))
+grp_fill <- setNames(SEV_GROUP3_COLS, SEV_GROUP3_LABELS)
+
+for (ti in c("CSF", "PBMC")) {
+  d <- donor_pct_sev %>% filter(tissue == ti)
+  print(ggplot(d, aes(patient_ID, proportion, fill = group)) +
+    geom_col(position = "dodge") + scale_fill_manual(values = grp_fill) +
+    labs(x = NULL, y = "Cell type proportion", fill = NULL, title = paste("Myeloid composition per donor -", ti)) +
+    theme_classic() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    facet_wrap(~ celltype_mc))
+  ggsave(file.path(path$graphs_myeloid, paste0("barchart_MC_Distribu_pat_", ti, "_patientbased.png")), width = 10, height = 7, dpi = 300)
+
+  print(ggplot(d, aes(group, proportion, fill = group)) +
+    stat_summary(fun = median, geom = "bar", width = 0.7) +
+    geom_jitter(width = 0.15, size = 1, alpha = 0.7) +
+    scale_fill_manual(values = grp_fill) +
+    labs(x = NULL, y = "Cell type proportion", title = paste("Myeloid composition by severity group -", ti)) +
+    theme_classic() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+    facet_wrap(~ celltype_mc, nrow = 5, scales = "free_y"))
+  ggsave(file.path(path$graphs_myeloid, paste0("barchart_MC_Distribu_sev_", ti, "_patientbased.png")), width = 10, height = 7, dpi = 300)
+}
+```
+
+#### 3.9.6.2 Mean proportions per group
+
+```{r}
+pie <- function(d, facet) ggplot(d, aes(x = "", y = mean_prop, fill = celltype_mc)) +
+  geom_col(width = 1, color = "white") + coord_polar(theta = "y") + facet_grid(facet) +
+  labs(fill = "Cell type") + theme_void() + scale_fill_npg() +
+  theme(strip.text = element_text(size = 10, face = "bold"), plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+
+print(pie(donor_pct_sev %>% group_by(tissue, group, celltype_mc) %>% summarise(mean_prop = mean(proportion), .groups = "drop"),
+          tissue ~ group) + ggtitle("Myeloid cell type proportions per severity group"))
+ggsave(file.path(path$graphs_myeloid, "piechart_MC_Distribu_patientbased1.png"), width = 10, height = 7, dpi = 300)
+print(pie(donor_pct %>% group_by(tissue, diagnosis, celltype_mc) %>% summarise(mean_prop = mean(proportion), .groups = "drop"),
+          tissue ~ diagnosis) + ggtitle("Myeloid cell type proportions per diagnosis"))
+ggsave(file.path(path$graphs_myeloid, "piechart_MC_Distribu_patientbased2.png"), width = 10, height = 7, dpi = 300)
+```
+
+## 3.10 Pseudobulk DEG
+
+```{r myeloid-deg-run}
+gs_units_mc <- deg_loo_units(myeloidcells_DEG, names(myeloidcells_DEG), "all_myeloid", "celltype_mc",
+                             min_cells = DEG_MIN_CELLS)
+deg_all_myeloid <- dplyr::bind_rows(lapply(gs_units_mc, function(u) {
+  message(u$tissue, " / ", u$level, " / ", u$subset)
+  flatten_contrasts(run_all_contrasts(u$get()), u$tissue, u$level, u$subset)
+}))
+deg_all_myeloid <- collect_deg_results(deg_all_myeloid, csv_prefix = file.path(path$tables, "DEG_myeloid"))
+
+deg_all_myeloid %>%
+  group_by(tissue, level, subset, comparison) %>%
+  summarise(status = dplyr::first(status), .groups = "drop") %>%
+  dplyr::count(status)
+
+deg_headline_myeloid <- deg_all_myeloid %>% dplyr::filter(status == "ok", !gene_class %in% DEG_MASK_CLASSES)
+MYELOID_VOLCANO_CONTRASTS <- deg_report_contrasts()
+deg_label <- function(cmp) if (cmp == "xALD_vs_ctrl") "X-ALD vs Control" else deg_contrast_labels[[cmp]]
+```
+
+### 3.10.1 Volcano plots
+
+```{r myeloid-volcano-all, fig.width = 10, fig.height = 7}
+for (ti in c("CSF", "PBMC")) for (cmp in MYELOID_VOLCANO_CONTRASTS) {
+  df <- deg_headline_myeloid %>% dplyr::filter(tissue == ti, level == "all_myeloid", comparison == cmp)
+  if (nrow(df) < 5) next
+  p <- plot_volcano(df, title = paste("Pseudobulk DEG —", ti, "(", deg_label(cmp), ")"),
+                    lfc_col = "log2FC", padj_col = "padj", gene_col = "gene",
+                    subtitle = if (is_sev3_comparison(cmp)) SEV_CONFOUND_NOTE else NULL)
+  print(p)
+  ggsave(file.path(path$graphs_myeloid, paste0("Volcano_MC_Pseudobulk_DEG_", ti, "_", cmp, ".png")),
+         p, width = 10, height = 7, dpi = 300)
+}
+```
+
+#### 3.10.1.1 Per cell type
+
+```{r myeloid-volcano-celltype, fig.width = 10, fig.height = 7}
+for (ti in c("CSF", "PBMC")) {
+  cts <- sort(unique(deg_headline_myeloid$subset[deg_headline_myeloid$tissue == ti & deg_headline_myeloid$level == "celltype"]))
+  for (ct in cts) for (cmp in MYELOID_VOLCANO_CONTRASTS) {
+    df <- deg_headline_myeloid %>% dplyr::filter(tissue == ti, level == "celltype", subset == ct, comparison == cmp)
+    if (nrow(df) < 5) next
+    p <- plot_volcano(df, title = paste(ti, "-", ct, "-", deg_label(cmp)),
+                      lfc_col = "log2FC", padj_col = "padj", gene_col = "gene",
+                      subtitle = if (is_sev3_comparison(cmp)) SEV_CONFOUND_NOTE else NULL)
+    print(p)
+    ggsave(file.path(path$graphs_myeloid, paste0("volcano_celltype_", ti, "_", sanitize(ct), "_", cmp, ".png")),
+           p, width = 10, height = 7, dpi = 300)
+  }
+}
+```
+
+### 3.10.2 DEG counts per cell type
+
+```{r myeloid-deg-summary, fig.width = 7, fig.height = 6}
+for (ti in c("CSF", "PBMC")) for (cmp in MYELOID_VOLCANO_CONTRASTS) {
+  df <- deg_headline_myeloid %>% dplyr::filter(tissue == ti, level == "celltype", comparison == cmp)
+  if (nrow(df) < 5) next
+  p <- plot_deg_summary(df, group_col_name = "subset",
+                        title = paste0(ti, " — myeloid cells (", deg_label(cmp), ")"),
+                        lfc_col = "log2FC", padj_col = "padj",
+                        subtitle = if (is_sev3_comparison(cmp)) SEV_CONFOUND_NOTE else NULL)
+  print(p)
+  ggsave(file.path(path$graphs_myeloid, paste0("deg_summary_", ti, "_", cmp, "_myeloid.png")),
+         p, width = 7, height = 6, dpi = 300)
+}
+```
+
+#### 3.10.2.1 Per-donor views
+
+```{r myeloid-deg-donor, fig.width = 9, fig.height = 8}
+donor_lfc_mc <- deg_donor_views(gs_units_mc, deg_all_myeloid, file.path(path$graphs_myeloid, "deg_donor"), "myeloid",
+                                contrasts = MYELOID_VOLCANO_CONTRASTS, stage_genes = deg_stage_genes("myeloid"))
+readr::write_csv(donor_lfc_mc, file.path(path$tables, "DEG_myeloid_donor_lfc.csv.gz"))
+```
+
+## 3.11 Gene sets and TF activity
+
+```{r myeloid-gs-inputs}
+if (!exists("myeloidcells_DEG")) {
+  myeloidcells_DEG <- lapply(add_severity(qread(myeloid_output)), function(so) {
+    so$sev_grp <- sev_group3(so$severity); so })
+}
+if (!exists("deg_all_myeloid"))
+  deg_all_myeloid <- readr::read_csv(file.path(path$tables, "DEG_myeloid_all_genes.csv"), show_col_types = FALSE)
+if (!exists("MYELOID_VOLCANO_CONTRASTS")) MYELOID_VOLCANO_CONTRASTS <- deg_report_contrasts()
+```
+
+### 3.11.1 Donor covariates
+
+```{r myeloid-gs-covariates}
+cov_mc <- lineage_covariates(myeloidcells_DEG)
+readr::write_csv(cov_mc, file.path(path$tables, "donor_covariates_myeloid.csv"))
+kable_save(cov_mc %>% dplyr::arrange(sev_grp, donor), "donor_covariates_myeloid", caption = "Donor covariates")
+
+confound_status <- function(cov, var) {
+  x <- cov[!is.na(cov$severity_active) & !is.na(cov[[var]]), ]
+  if (!nrow(x)) return("not assessable")
+  tb <- table(x$severity_active, as.character(x[[var]]))
+  if (nrow(tb) < 2) return("not assessable (one arm)")
+  if (all(rowSums(tb > 0) == 1) && !identical(colnames(tb)[tb[1, ] > 0], colnames(tb)[tb[2, ] > 0]))
+    return("complete")
+  p <- prop.table(tb, 1)
+  if (isTRUE(all.equal(unname(p[1, ]), unname(p[2, ])))) "none" else "partial"
+}
+for (v in c("hydrocortisone", "lorenzo", "concurrent")) {
+  if (all(is.na(cov_mc[[v]]))) next
+  print(kable_save(table(group = cov_mc$sev_grp,
+                         value = ifelse(is.na(cov_mc[[v]]), "NA", as.character(cov_mc[[v]]))),
+                   paste0("covariate_crosstab_", v, "_myeloid"),
+                   caption = sprintf("%s by group -- confounding with stage 3 vs 1-2: %s", v, confound_status(cov_mc, v))))
+}
+cov_mc %>%
+  tidyr::pivot_longer(c(serum_nfl, age), names_to = "variable", values_to = "value") %>%
+  dplyr::group_by(variable, sev_grp) %>%
+  dplyr::summarise(n = sum(!is.na(value)), median = stats::median(value, na.rm = TRUE),
+                   min = suppressWarnings(min(value, na.rm = TRUE)),
+                   max = suppressWarnings(max(value, na.rm = TRUE)), .groups = "drop") %>%
+  kable_save("covariate_continuous_myeloid", digits = 2, caption = "Continuous covariates by group")
+```
+
+### 3.11.2 Global-shift diagnostics
+
+```{r myeloid-gs-shift-diagnostics, fig.width = 7.2, fig.height = 6}
+if (!exists("gs_units_mc"))
+  gs_units_mc <- deg_loo_units(myeloidcells_DEG, names(myeloidcells_DEG), "all_myeloid", "celltype_mc",
+                               min_cells = DEG_MIN_CELLS)
+shift_mc_report <- gs_shift_report(deg_all_myeloid, myeloidcells_DEG, LINEAGE_GS_CONTRASTS, c("all_myeloid", "celltype"),
+                                   "all_myeloid", "celltype_mc", "myeloid", path$graphs_myeloid)
+```
+
+### 3.11.3 Gene-set tests
+
+```{r myeloid-gs-run}
+GS_CONTRASTS_MC <- LINEAGE_GS_CONTRASTS
+gs_universe_mc  <- unique(deg_all_myeloid$gene[deg_all_myeloid$status == "ok"])
+gs_mc           <- gs_assemble(gs_universe_mc)
+
+kable_save(gs_mc$provenance %>% dplyr::arrange(panel, set), "geneset_provenance_myeloid",
+             caption = "Gene sets: source, size, genes among the tested genes")
+
+gs_res_mc_all <- gs_run(deg_all_myeloid, gs_mc$sets, GS_CONTRASTS_MC)
+readr::write_csv(gs_res_mc_all, file.path(path$tables, "geneset_myeloid_all_rankings.csv"))
+
+gs_reg_mc     <- gs_registry_from_units(gs_units_mc)
+gs_reg_mc_sev <- gs_registry_severity(gs_units_mc, setdiff(GS_CONTRASTS_MC, "xALD_vs_ctrl"))
+gs_voom_mc    <- dplyr::bind_rows(gs_run_voom(gs_reg_mc, gs_mc$sets), gs_run_voom(gs_reg_mc_sev, gs_mc$sets))
+invisible(gc())
+
+gs_res_mc <- gs_finalise(gs_res_mc_all, gs_mc$provenance, gs_voom_mc)
+gs_res_mc$shift_robust <- suppressWarnings(gs_shift_robust(gs_res_mc))
+readr::write_csv(gs_res_mc, file.path(path$tables, "geneset_myeloid.csv"))
+
+shift_mc <- gs_shift_diagnostics(deg_all_myeloid, GS_CONTRASTS_MC, c("all_myeloid", "celltype"), gs_res_mc_all)
+kable_save(shift_mc, "geneset_myeloid_shift_diagnostics", digits = 3,
+           caption = "Myeloid: global-shift diagnostics per family, gene and set level, with verdict")
+
+gs_res_mc %>%
+  dplyr::filter(agree, panel != "control") %>%
+  dplyr::arrange(comparison, tissue, level, subset, padj_camera_vc_est, padj_fgsea) %>%
+  dplyr::select(comparison, tissue, level, subset, set, inference, tier, NES, dplyr::any_of(c(
+    "mean_logFC", "corr_camera_vc_est", "padj_camera_vc_est", "padj_fry", "fry_sig", "padj_camera_vc")),
+    padj_fgsea, padj_camera, dplyr::any_of(c("robust_matched", "robust_intensity")),
+    global_shift_flag, ieg_flag, leading_edge) %>%
+  kable_save("geneset_myeloid_significant", digits = 3,
+             caption = "Significant sets (donor-level call where available, else gene-level screen)")
+```
+
+```{r myeloid-gs-figure, fig.width = 7.2, fig.height = 6}
+GS_FIG_GROUPS <- list(dx = "xALD_vs_ctrl", severity = DEG_SEV_REPORT)
+for (gn in names(GS_FIG_GROUPS)) {
+  d <- gs_res_mc %>% dplyr::filter(comparison %in% GS_FIG_GROUPS[[gn]])
+  if (!nrow(d)) next
+  p_gs_mc <- gs_plot_dots(d, gs_mc$provenance,
+    title = paste0("Myeloid gene sets, ", if (gn == "dx") "X-ALD vs control" else "severity",
+                   " (NES; ring = significant, column agree)"))
+  print(p_gs_mc)
+  save_umap_fig(p_gs_mc, paste0("geneset_myeloid_dots", if (gn != "dx") paste0("_", gn)), path$graphs_myeloid,
+                width_mm = FIG_WIDTH_MM[["double"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(3.2 * length(unique(d$set)) + 45)))
+}
+```
+
+### 3.11.4 Per-donor set scores and clinical correlates
+
+```{r myeloid-gs-donor, fig.width = 7.2, fig.height = 7}
+gs_score_sets <- gs_mc$sets[gs_mc$provenance$set[gs_mc$provenance$source != "regex over tested genes"]]
+gs_donor_mc <- gs_donor_scores(myeloidcells_DEG, gs_score_sets, "celltype_mc") %>%
+  dplyr::left_join(cov_mc, by = "donor")
+readr::write_csv(gs_donor_mc, file.path(path$tables, "geneset_myeloid_donor_scores.csv"))
+
+donor_assoc_mc <- gs_donor_associations(gs_donor_mc)
+readr::write_csv(donor_assoc_mc, file.path(path$tables, "geneset_myeloid_donor_associations.csv"))
+
+donor_assoc_mc %>%
+  dplyr::filter(tissue == "CSF") %>%
+  dplyr::arrange(p_nfl) %>%
+  dplyr::select(celltype, set, delta_dx, p_dx, p_sev, rho_nfl, p_nfl, n_nfl, p_lorenzo, p_hydrocortisone) %>%
+  utils::head(25) %>%
+  kable_save("geneset_myeloid_donor_top25_CSF", digits = 3,
+             caption = "CSF: per-donor set scores vs group and clinical variables (top 25 by NfL)")
+
+GS_DONOR_SHOW <- intersect(gs_current_names(c("SREBP2_TARGETS_CORE", "LXR_TARGETS", "LAM_CORE",
+                             "LYSOSOMAL_DEGRADATIVE", "LIPID_STORAGE_ESTERIFICATION",
+                             "VLCFA_PEROXISOME", "GC_RESPONSE_MYELOID")), names(gs_score_sets))
+
+d_show <- gs_donor_mc %>%
+  dplyr::filter(tissue == "CSF", set %in% GS_DONOR_SHOW, !is.na(sev_grp)) %>%
+  dplyr::mutate(set = factor(sub("_CUSTOM$", "", set), levels = sub("_CUSTOM$", "", GS_DONOR_SHOW)),
+                hydrocortisone = ifelse(is.na(hydrocortisone), "NA", as.character(hydrocortisone)))
+p_donor_mc <- ggplot2::ggplot(d_show, ggplot2::aes(sev_grp, score, colour = sev_grp)) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey85", linewidth = FIG_LINE_MM) +
+  ggplot2::geom_point(ggplot2::aes(shape = hydrocortisone), size = 1.2,
+                      position = ggplot2::position_jitter(width = 0.12, height = 0, seed = 1)) +
+  ggplot2::stat_summary(fun = stats::median, fun.min = stats::median, fun.max = stats::median,
+                        geom = "crossbar", width = 0.5, linewidth = FIG_LINE_MM, colour = "black") +
+  ggplot2::scale_colour_manual(values = SEV_GROUP3_COLS, guide = "none") +
+  ggplot2::scale_x_discrete(labels = SEV_GROUP3_LABELS) +
+  ggplot2::facet_grid(set ~ celltype) +
+  ggplot2::labs(x = NULL, y = "Per-donor set score (mean z)", shape = "Hydrocortisone",
+                title = "CSF myeloid cells: per-donor set scores") +
+  gs_theme() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                 strip.text.y = ggplot2::element_text(angle = 0, hjust = 0))
+print(p_donor_mc)
+save_umap_fig(p_donor_mc, "geneset_myeloid_donor_scores_CSF", path$graphs_myeloid,
+              width_mm = FIG_WIDTH_MM[["double"]],
+              height_mm = min(FIG_MAX_DEPTH_MM, 28 * length(GS_DONOR_SHOW) + 30))
+
+d_nfl <- d_show %>% dplyr::filter(diagnosis %in% "X-ALD", !is.na(log10_nfl))
+if (nrow(d_nfl)) {
+  p_nfl_mc <- ggplot2::ggplot(d_nfl, ggplot2::aes(log10_nfl, score)) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x, se = FALSE, colour = "grey60", linewidth = FIG_LINE_MM) +
+    ggplot2::geom_point(ggplot2::aes(colour = sev_grp, shape = hydrocortisone), size = 1.2) +
+    ggplot2::scale_colour_manual(values = SEV_GROUP3_COLS, labels = SEV_GROUP3_LABELS, name = NULL) +
+    ggplot2::facet_grid(set ~ celltype) +
+    ggplot2::labs(x = "log10 serum NfL (pg/mL)", y = "Per-donor set score (mean z)", shape = "Hydrocortisone",
+                  title = "CSF myeloid cells: set scores vs serum NfL (X-ALD)") +
+    gs_theme() + ggplot2::theme(strip.text.y = ggplot2::element_text(angle = 0, hjust = 0))
+  print(p_nfl_mc)
+  save_umap_fig(p_nfl_mc, "geneset_myeloid_donor_vs_nfl_CSF", path$graphs_myeloid,
+                width_mm = FIG_WIDTH_MM[["double"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, 28 * length(GS_DONOR_SHOW) + 30))
+}
+```
+
+### 3.11.5 Transcription-factor activity (CollecTRI, ulm)
+
+```{r myeloid-tf, fig.width = 7.2, fig.height = 6}
+tf_net <- tryCatch(tf_get_network(), error = function(e) {
+  warning("TF network unavailable: ", conditionMessage(e), call. = FALSE); NULL })
+tf_res_mc <- NULL
+if (!is.null(tf_net)) {
+  tf_res_mc <- tf_run(deg_all_myeloid, tf_net, GS_CONTRASTS_MC)
+  readr::write_csv(tf_res_mc, file.path(path$tables, "tf_activity_myeloid.csv"))
+  readr::write_csv(attr(tf_res_mc, "families"),
+                   file.path(path$tables, "tf_activity_myeloid_families.csv"))
+  print(table(tf_res_mc$comparison, tf_res_mc$tissue))
+
+  tf_top <- tf_res_mc %>% dplyr::filter(padj < 0.05) %>%
+    dplyr::group_by(tf) %>% dplyr::summarise(m = max(abs(score)), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(m)) %>% utils::head(15) %>% dplyr::pull(tf)
+  tf_show <- unique(c(intersect(TF_OF_INTEREST, tf_res_mc$tf), tf_top))
+
+  p_tf_mc <- tf_plot_heatmap(tf_res_mc, tf_show,
+                             title = paste0("Myeloid transcription-factor activity (",
+                                            attr(tf_net, "network") %||% "network", ", ulm)"))
+  print(p_tf_mc)
+  save_umap_fig(p_tf_mc, "tf_activity_myeloid", path$graphs_myeloid,
+                width_mm = FIG_WIDTH_MM[["double"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(3.4 * length(tf_show) + 40)))
+}
+```
+
+### 3.11.6 Treatment confounding check
+
+```{r myeloid-confound}
+gs_treatment_check(gs_res_mc, gs_mc, tf_res_mc, donor_assoc_mc, "myeloid")
+```
+
+### 3.11.7 Per-donor scores for all sets
+
+```{r myeloid-donor-allsets}
+allsets_panel <- setNames(gs_mc$provenance$panel, gs_mc$provenance$set)
+donor_all_mc <- gs_donor_scores(myeloidcells_DEG, gs_mc$sets, "celltype_mc") %>%
+  dplyr::left_join(cov_mc, by = "donor") %>%
+  dplyr::mutate(panel = unname(allsets_panel[set]))
+readr::write_csv(donor_all_mc, file.path(path$tables, "geneset_myeloid_donor_scores_allsets.csv"))
+
+donor_all_mc %>%
+  dplyr::distinct(tissue, celltype, donor, sev_grp) %>%
+  dplyr::count(tissue, celltype, sev_grp) %>%
+  tidyr::pivot_wider(names_from = sev_grp, values_from = n, values_fill = 0) %>%
+  kable_save("geneset_myeloid_donor_scores_allsets_coverage", caption = "Donors per tissue x myeloid sub-type and group")
+
+for (ti in unique(donor_all_mc$tissue)) {
+  donor_all_mc %>%
+    dplyr::filter(tissue == ti) %>%
+    dplyr::select(celltype, donor, sev_grp, dplyr::any_of(c("hydrocortisone", "lorenzo", "serum_nfl")), set, score) %>%
+    tidyr::pivot_wider(names_from = set, values_from = score) %>%
+    dplyr::arrange(celltype, sev_grp, donor) %>%
+    readr::write_csv(file.path(path$tables, paste0("geneset_myeloid_donor_scores_allsets_wide_", ti, ".csv")))
+}
+
+donor_groups_mc <- donor_all_mc %>%
+  dplyr::filter(!is.na(sev_grp)) %>%
+  dplyr::group_by(tissue, celltype, panel, set) %>%
+  dplyr::summarise(
+    n_ctrl  = sum(sev_grp == "control"), n_sev12 = sum(sev_grp == "sev12"), n_sev3 = sum(sev_grp == "sev3"),
+    med_ctrl  = stats::median(score[sev_grp == "control"]),
+    med_sev12 = stats::median(score[sev_grp == "sev12"]),
+    med_sev3  = stats::median(score[sev_grp == "sev3"]),
+    delta_xald_ctrl  = stats::median(score[sev_grp != "control"]) - med_ctrl,
+    delta_sev3_sev12 = med_sev3 - med_sev12,
+    .groups = "drop")
+kable_save(donor_groups_mc, "geneset_myeloid_donor_scores_allsets_groups", digits = 2,
+           caption = "Per-donor set scores, median per group; delta = X-ALD minus control and stage 3 minus 1-2")
+```
+
+```{r myeloid-donor-allsets-figures, fig.width = 7.2, fig.height = 8}
+panel_order <- c("sterol", "lipid", "VLCFA", "stress", "immune", "confound", "control")
+set_order <- donor_all_mc %>%
+  dplyr::distinct(panel, set) %>%
+  dplyr::mutate(panel = factor(panel, levels = union(panel_order, unique(panel)))) %>%
+  dplyr::arrange(panel, set) %>% dplyr::pull(set)
+yes_no <- function(x) ifelse(tolower(as.character(x)) %in% c("yes", "y", "true", "1", "ja"), "+",
+                             ifelse(is.na(x), "?", "-"))
+
+for (ti in unique(donor_all_mc$tissue)) for (ct in unique(donor_all_mc$celltype[donor_all_mc$tissue == ti])) {
+  d <- donor_all_mc %>% dplyr::filter(tissue == ti, celltype == ct, !is.na(sev_grp))
+  if (!nrow(d)) next
+  don <- d %>% dplyr::distinct(donor, sev_grp, hydrocortisone, lorenzo) %>%
+    dplyr::arrange(sev_grp, donor) %>%
+    dplyr::mutate(lab = sprintf("%s  HC%s LO%s", donor, yes_no(hydrocortisone), yes_no(lorenzo)))
+  d <- d %>% dplyr::mutate(
+    donor = factor(donor, levels = don$donor, labels = don$lab),
+    set   = factor(set, levels = rev(intersect(set_order, unique(set)))),
+    panel = factor(panel, levels = union(panel_order, unique(panel))))
+  lim <- max(abs(d$score), na.rm = TRUE)
+  p <- ggplot2::ggplot(d, ggplot2::aes(donor, set, fill = score)) +
+    ggplot2::geom_tile(colour = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                                  midpoint = 0, limits = c(-lim, lim), name = "Score\n(mean z)") +
+    ggplot2::facet_grid(panel ~ sev_grp, scales = "free", space = "free",
+                        labeller = ggplot2::labeller(sev_grp = SEV_GROUP3_LABELS)) +
+    ggplot2::labs(x = NULL, y = NULL, title = paste0(ti, ", ", ct, ": per-donor set scores")) +
+    gs_theme() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = 0.5, size = FIG_MIN_PT),
+                   axis.text.y = ggplot2::element_text(size = FIG_MIN_PT),
+                   strip.text.y = ggplot2::element_text(angle = 0, hjust = 0),
+                   axis.line = ggplot2::element_blank(), axis.ticks = ggplot2::element_blank())
+  print(p)
+  save_umap_fig(p, paste0("geneset_myeloid_donor_heatmap_", ti, "_", sanitize(ct)), path$graphs_myeloid,
+                width_mm = FIG_WIDTH_MM[["double"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(2.6 * length(unique(d$set)) + 45)))
+}
+
+for (ti in unique(donor_groups_mc$tissue)) {
+  d <- donor_groups_mc %>% dplyr::filter(tissue == ti) %>%
+    dplyr::mutate(set = factor(set, levels = rev(intersect(set_order, unique(set)))),
+                  panel = factor(panel, levels = union(panel_order, unique(panel))),
+                  celltype = factor(celltype, levels = unique(c("all", sort(unique(celltype))))))
+  lim <- max(abs(d$delta_xald_ctrl), na.rm = TRUE)
+  p <- ggplot2::ggplot(d, ggplot2::aes(celltype, set, fill = delta_xald_ctrl)) +
+    ggplot2::geom_tile(colour = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                                  midpoint = 0, limits = c(-lim, lim),
+                                  name = "X-ALD minus\ncontrol\n(median z)") +
+    ggplot2::facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+    ggplot2::labs(x = NULL, y = NULL,
+                  title = paste0(ti, " myeloid: per-donor set scores, X-ALD minus control")) +
+    gs_theme() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                                       size = FIG_LEGEND_PT),
+                   axis.text.y = ggplot2::element_text(size = FIG_MIN_PT),
+                   strip.text.y = ggplot2::element_text(angle = 0, hjust = 0),
+                   axis.line = ggplot2::element_blank(), axis.ticks = ggplot2::element_blank())
+  print(p)
+  save_umap_fig(p, paste0("geneset_myeloid_donor_delta_", ti), path$graphs_myeloid,
+                width_mm = FIG_WIDTH_MM[["onehalf"]],
+                height_mm = min(FIG_MAX_DEPTH_MM, round(2.6 * length(unique(d$set)) + 45)))
+}
+```
+
+## 3.12 Leave-one-donor-out: DEG and gene sets
+
+```{r myeloid-loo}
+units_mc <- if (exists("gs_units_mc")) Filter(function(u) u$tissue %in% DEG_LOO_TISSUES, gs_units_mc) else
+  deg_loo_units(myeloidcells_DEG, DEG_LOO_TISSUES, "all_myeloid", "celltype_mc")
+loo_mc   <- deg_loo_run(units_mc, deg_all_myeloid, "myeloid")
+loo_gs_mc <- gs_loo_voom(c(gs_reg_mc, gs_reg_mc_sev), gs_mc$sets, gs_res_mc)
+
+readr::write_csv(loo_mc$genes, file.path(path$tables, "DEG_myeloid_loo_genes.csv"))
+readr::write_csv(loo_mc$folds, file.path(path$tables, "DEG_myeloid_loo_folds.csv"))
+loo_sum_mc <- deg_loo_summary(loo_mc$genes)
+kable_save(loo_sum_mc, "DEG_myeloid_loo_summary", digits = 3,
+           caption = "Myeloid DEG: share of significant genes that stay significant when one donor is removed")
+deg_all_myeloid <- collect_deg_results(loo_annotate(deg_all_myeloid, loo_mc$genes, "gene"),
+                                       csv_prefix = file.path(path$tables, "DEG_myeloid"))
+gs_res_mc <- loo_annotate(gs_res_mc, loo_gs_mc, "set")
+readr::write_csv(gs_res_mc, file.path(path$tables, "geneset_myeloid.csv"))
+kable_save(deg_loo_summary(loo_gs_mc), "geneset_myeloid_loo_summary", digits = 3,
+           caption = "Myeloid gene sets: share of significant sets retained when one donor is removed")
+gs_res_mc %>%
+  dplyr::filter(agree, panel != "control") %>%
+  dplyr::arrange(comparison, tissue, level, subset, padj_camera_vc_est) %>%
+  dplyr::select(comparison, tissue, level, subset, set, inference, tier, NES, padj_camera_vc_est, padj_fry,
+                global_shift_flag, ieg_flag, loo_frac_retained, loo_status, loo_lost_without, leading_edge) %>%
+  kable_save("geneset_myeloid_significant", digits = 3,
+             caption = "Significant sets (voom camera, estimated correlation), with leave-one-donor-out")
+knitr::kable(loo_sum_mc, caption = "Myeloid DEG leave-one-donor-out (CSF and PBMC)")
+```
+
+# Session info
+
+```{r session-info-03-myeloid}
+sessionInfo()
+```

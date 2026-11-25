@@ -1,0 +1,770 @@
+---
+title: "xALD single-cell atlas -- Part 7: Pseudotime"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/07_pseudotime.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 11, fig.height = 8, dpi = 110)
+```
+
+# Part 7: Pseudotime
+
+## 7.1 Setup
+
+```{r packages}
+set.seed(1234)
+```
+
+## 7.2 Parameters
+
+```{r parameters}
+overwrite_cache <- FALSE
+
+sources <- list(
+  t       = list(file = "07_t_cells_filtered_xALD.qs",      label_col = "celltype"),
+  myeloid = list(file = "05_myeloidCells_filtered_xALD.qs", label_col = "celltype_mc")
+)
+compartment_use <- "CSF"
+
+group_var <- "diagnosis"
+ref_level <- "control"
+donor_var <- "donor"
+batch_var <- donor_var
+
+n_cores <- 8
+
+recompute_embedding <- TRUE
+reduction_reuse     <- "harmony"
+umap_reuse          <- "umap"
+n_hvg       <- LINEAGE_N_HVG
+n_pcs       <- LINEAGE_N_PCS
+n_dims      <- max(LINEAGE_DIMS)
+n_dims_traj <- 15
+
+min_cells_lineage <- 300
+min_cells_label   <- 30
+min_cells_donor   <- 20
+max_cells_donor   <- 2000
+
+run_topology  <- TRUE
+topology_reps <- 50
+run_evaluateK <- FALSE
+nknots        <- 6
+n_gam_genes   <- 1000
+n_bins        <- 5
+min_cells_pb  <- 10
+
+lineages <- list(
+  CD4 = list(
+    source  = "t",
+    include = "^CD4|Treg|Tfh",
+    exclude = "CD8|MAIT|gd[ _-]?T|γδ|NK",
+    start   = c("CCR7", "SELL", "TCF7", "LEF1"),
+    end     = c("CCL5", "GZMK", "PRDM1", "KLRB1"),
+    goi     = c("GZMK", "GZMA", "GZMM", "CCL5", "FOXP3")
+  ),
+  CD8 = list(
+    source  = "t",
+    include = "^CD8",
+    exclude = "CD4|MAIT|gd[ _-]?T|γδ|NK",
+    start   = c("CCR7", "SELL", "TCF7", "LEF1"),
+    end     = c("GZMB", "PRF1", "GNLY", "CX3CR1"),
+    goi     = c("GZMK", "GZMA", "GZMM", "GZMB", "PRF1")
+  ),
+  Mono_Mac = list(
+    source  = "myeloid",
+    include = "mono|macro|mdm|bam|microglia",
+    exclude = "DC",
+    start   = c("CD14", "LYZ", "S100A8", "VCAN"),
+    end     = c("C1QA", "C1QB", "APOE", "CD163"),
+    goi     = c("CD14", "FCGR3A", "HLA-DRA", "C1QA", "APOE")
+  )
+)
+
+dir.create(path$cache_pseudotime, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 7.3 Helpers
+
+```{r helpers}
+lin_dir <- function(nm) {
+  d <- file.path(path$results_pseudotime, nm)
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  d
+}
+
+cached <- function(file, expr) {
+  if (file.exists(file) && !overwrite_cache) return(readRDS(file))
+  res <- expr
+  saveRDS(res, file)
+  res
+}
+
+safe <- function(expr, what) {
+  tryCatch(expr, error = function(e) {
+    message("  ", what, " failed: ", conditionMessage(e)); NULL
+  })
+}
+
+show_table <- function(df, caption = NULL, n = 20) {
+  if (is.null(df) || nrow(df) == 0) { cat("_no results_\n\n"); return(invisible()) }
+  cat(knitr::kable(head(as.data.frame(df), n), digits = 3, caption = caption,
+                   format = "markdown"), sep = "\n")
+  cat("\n\n")
+}
+
+get_layer <- function(so, layer) {
+  if (packageVersion("SeuratObject") >= "5.0.0") {
+    LayerData(so, assay = "RNA", layer = layer)
+  } else {
+    GetAssayData(so, assay = "RNA", slot = layer)
+  }
+}
+
+prep_object <- function(so, label_col) {
+  so <- add_severity(so, quiet = TRUE)
+  so$sev_grp <- sev_group3(so$severity)
+  needed  <- unique(c(label_col, group_var, donor_var, batch_var))
+  missing <- setdiff(needed, colnames(so@meta.data))
+  if (length(missing) > 0)
+    stop("Missing metadata columns: ", paste(missing, collapse = ", "),
+         "\nAvailable: ", paste(colnames(so@meta.data), collapse = ", "))
+  DefaultAssay(so) <- "RNA"
+  if (inherits(so[["RNA"]], "Assay5")) so[["RNA"]] <- JoinLayers(so[["RNA"]])
+  md <- so@meta.data
+  so$label <- as.character(md[[label_col]])
+  so$group <- relevel(factor(md[[group_var]]), ref = ref_level)
+  so$donor <- factor(md[[donor_var]])
+  so$batch <- factor(md[[batch_var]])
+  if (any(tapply(so$group, so$donor, function(x) length(unique(x))) > 1))
+    stop("Some donors map to more than one group.")
+  so
+}
+
+in_lineage <- function(labels, cfg) {
+  if (!is.null(cfg$levels)) return(labels %in% cfg$levels)
+  hit <- grepl(cfg$include, labels, ignore.case = TRUE)
+  if (!is.null(cfg$exclude)) hit <- hit & !grepl(cfg$exclude, labels, ignore.case = TRUE)
+  hit
+}
+
+marker_score <- function(so, genes) {
+  genes <- intersect(genes, rownames(so))
+  if (length(genes) == 0) return(rep(NA_real_, ncol(so)))
+  m <- as.matrix(get_layer(so, "data")[genes, , drop = FALSE])
+  m <- t(scale(t(m)))
+  m[is.nan(m)] <- 0
+  colMeans(m)
+}
+
+cap_per_donor <- function(so, n) {
+  if (is.null(n)) return(so)
+  keep <- so@meta.data %>%
+    mutate(cell = colnames(so)) %>%
+    group_by(donor) %>%
+    slice_sample(n = n) %>%
+    pull(cell)
+  subset(so, cells = keep)
+}
+
+embed_lineage <- function(so) {
+  if (!recompute_embedding) {
+    so   <- FindVariableFeatures(NormalizeData(so, verbose = FALSE), nfeatures = n_hvg, verbose = FALSE)
+    miss <- setdiff(c(reduction_reuse, umap_reuse), Reductions(so))
+    if (length(miss) > 0) stop("Reductions not found: ", paste(miss, collapse = ", "))
+    return(list(so = so, red_traj = reduction_reuse, red_umap = umap_reuse))
+  }
+  so <- lineage_embed(so, batch_var = "batch", dims = seq_len(n_dims), n_pcs = n_pcs, n_hvg = n_hvg,
+                      neighbors = FALSE, umap_name = "umap")
+  list(so = so, red_traj = if ("harmony" %in% Reductions(so)) "harmony" else "pca", red_umap = "umap")
+}
+
+curve_df <- function(sce, dimred = "UMAP") {
+  tryCatch({
+    crvs <- slingCurves(embedCurves(sce, dimred))
+    bind_rows(lapply(seq_along(crvs), function(i) {
+      s <- crvs[[i]]$s[crvs[[i]]$ord, , drop = FALSE]
+      data.frame(x = s[, 1], y = s[, 2], lineage = paste0("Lineage", i))
+    }))
+  }, error = function(e) NULL)
+}
+
+pseudobulk <- function(counts, groups) {
+  groups <- factor(groups)
+  mm <- Matrix::sparse.model.matrix(~ 0 + groups)
+  colnames(mm) <- levels(groups)
+  as.matrix(counts %*% mm)
+}
+
+donor_test <- function(df, value) {
+  df <- droplevels(df)
+  if (nlevels(df$group) < 2) return(data.frame(test = NA, p_value = NA))
+  f <- as.formula(paste(value, "~ group"))
+  if (nlevels(df$group) == 2) {
+    data.frame(test = "Wilcoxon (donor level)",
+               p_value = suppressWarnings(wilcox.test(f, data = df)$p.value))
+  } else {
+    data.frame(test = "Kruskal-Wallis (donor level)",
+               p_value = kruskal.test(f, data = df)$p.value)
+  }
+}
+
+label_palette <- function(labs) {
+  labs  <- unique(as.character(labs))
+  cd4   <- labs[grepl("^CD4|Treg|Tfh", labs)]
+  cd8   <- setdiff(labs[grepl("^CD8", labs)], cd4)
+  other <- setdiff(labs, c(cd4, cd8))
+  pal <- c(setNames(colorRampPalette(c("#FCAE91", "#99000D"))(length(cd4)), cd4),
+           setNames(colorRampPalette(c("#9ECAE1", "#08306B"))(length(cd8)), cd8))
+  if (length(other) > 0) pal <- c(pal, setNames(scales::hue_pal()(length(other)), other))
+  pal
+}
+
+theme_umap <- theme_classic(base_size = 10) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+```
+
+## 7.4 Data and lineage assignment
+
+```{r load-data}
+t_cells_filtered       <- qread(file.path(path$objects, sources$t$file),       nthreads = n_cores)
+myeloid_cells_filtered <- qread(file.path(path$objects, sources$myeloid$file), nthreads = n_cores)
+stopifnot(compartment_use %in% names(t_cells_filtered),
+          compartment_use %in% names(myeloid_cells_filtered))
+
+csf_objs <- list(t       = t_cells_filtered[[compartment_use]],
+                 myeloid = myeloid_cells_filtered[[compartment_use]])
+rm(t_cells_filtered, myeloid_cells_filtered); invisible(gc())
+
+csf_objs <- Map(prep_object, csf_objs,
+                vapply(sources[names(csf_objs)], `[[`, character(1), "label_col"))
+
+grp_levels     <- levels(csf_objs$t$group)
+grp_cols       <- setNames(c("grey45", "#C0392B", "#2E86C1", "#8E44AD")[seq_along(grp_levels)],
+                           grp_levels)
+grp_cols_clean <- setNames(grp_cols, make.names(names(grp_cols)))
+```
+
+```{r donors}
+bind_rows(lapply(names(csf_objs), function(src)
+  csf_objs[[src]]@meta.data %>% distinct(donor, group) %>% count(group, name = "donors") %>%
+    mutate(source = src))) %>%
+  knitr::kable()
+```
+
+```{r assignment}
+assign_tab <- bind_rows(lapply(names(csf_objs), function(src) {
+  so   <- csf_objs[[src]]
+  labs <- sort(unique(so$label))
+  lin  <- vapply(labs, function(l) {
+    hits <- names(lineages)[vapply(lineages, function(cfg)
+      cfg$source == src && in_lineage(l, cfg), logical(1))]
+    if (length(hits) == 0) "– excluded" else paste(hits, collapse = " + ")
+  }, character(1))
+  cnt <- as.data.frame.matrix(table(so$label, so$group))[labs, , drop = FALSE]
+  data.frame(source = src, label = labs, lineage = lin, cnt,
+             check.names = FALSE, row.names = NULL)
+}))
+write.csv(assign_tab, file.path(path$results_pseudotime, "lineage_assignment.csv"), row.names = FALSE)
+knitr::kable(assign_tab)
+
+if (any(grepl("\\+", assign_tab$lineage)))
+  warning("Some labels are assigned to more than one lineage – refine include/exclude.")
+```
+
+## 7.5 Trajectories
+
+```{r build-trajectory-fn}
+build_trajectory <- function(lin_name, cfg) {
+  so <- csf_objs[[cfg$source]]
+  so <- subset(so, cells = colnames(so)[in_lineage(so$label, cfg)])
+  message(lin_name, ": ", ncol(so), " cells")
+  if (ncol(so) < min_cells_lineage) { message("  too few cells, skipped"); return(NULL) }
+
+  n_donor_grp <- tapply(so$donor, so$group, function(x) length(unique(x)))
+  if (any(is.na(n_donor_grp) | n_donor_grp < 2)) {
+    message("  fewer than 2 donors in a group, skipped"); return(NULL)
+  }
+
+  so <- cap_per_donor(so, max_cells_donor)
+  tab   <- table(so$label)
+  small <- names(tab)[tab < min_cells_label]
+  if (length(small) > 0) {
+    message("  dropping small labels: ", paste(small, collapse = ", "))
+    so <- subset(so, cells = colnames(so)[!so$label %in% small])
+  }
+
+  emb <- embed_lineage(so)
+  so  <- emb$so
+  so$start_score <- marker_score(so, cfg$start)
+  so$end_score   <- marker_score(so, cfg$end)
+
+  start_label <- if (!is.null(cfg$start_cluster)) cfg$start_cluster else
+    names(which.max(tapply(so$start_score, so$label, mean, na.rm = TRUE)))
+
+  traj_emb <- Embeddings(so, emb$red_traj)
+  sce <- SingleCellExperiment(
+    assays      = list(counts = get_layer(so, "counts")),
+    colData     = S4Vectors::DataFrame(
+      so@meta.data[, c("label", "group", "donor", "batch", "start_score", "end_score")]),
+    reducedDims = list(TRAJ = traj_emb[, seq_len(min(n_dims_traj, ncol(traj_emb)))],
+                       UMAP = Embeddings(so, emb$red_umap)[, 1:2])
+  )
+
+  imb <- imbalance_score(Object = reducedDim(sce, "UMAP"), conditions = sce$group,
+                         k = 20, smooth = 40)
+  sce$imbalance <- imb$scaled_scores
+
+  sce <- slingshot(sce, clusterLabels = "label", reducedDim = "TRAJ",
+                   start.clus = start_label, end.clus = cfg$end_cluster,
+                   approx_points = 150)
+  sds <- SlingshotDataSet(sce)
+  pt  <- slingPseudotime(sds, na = FALSE)
+  cw  <- slingCurveWeights(sds)
+  lin_names <- paste0("Lineage", seq_len(ncol(pt)))
+  colnames(pt) <- colnames(cw) <- lin_names
+  sce$pt_avg <- rowSums(pt * cw) / pmax(rowSums(cw), 1e-8)
+  paths <- setNames(vapply(slingLineages(sds), paste, character(1), collapse = " → "),
+                    lin_names)
+
+  sanity <- bind_rows(lapply(lin_names, function(l) {
+    keep <- cw[, l] > 0.5
+    data.frame(lineage   = l,
+               n_cells   = sum(keep),
+               rho_start = cor(pt[keep, l], sce$start_score[keep], method = "spearman", use = "complete.obs"),
+               rho_end   = cor(pt[keep, l], sce$end_score[keep],   method = "spearman", use = "complete.obs"))
+  }))
+
+  cell_df <- bind_rows(lapply(lin_names, function(l) {
+    keep <- cw[, l] > 0.5
+    data.frame(cell = colnames(sce)[keep], lineage = l, pt = pt[keep, l],
+               label = sce$label[keep], donor = sce$donor[keep], group = sce$group[keep])
+  }))
+
+  list(name = lin_name, cfg = cfg, sce = sce, sds = sds, pt = pt, cw = cw,
+       lin_names = lin_names, paths = paths, start_label = start_label,
+       hvg = VariableFeatures(so), sanity = sanity, cell_df = cell_df,
+       label_order = names(sort(tapply(sce$pt_avg, sce$label, median))),
+       curves = curve_df(sce, "UMAP"))
+}
+
+plot_trajectory <- function(tr) {
+  pal <- label_palette(tr$label_order)
+  df  <- data.frame(reducedDim(tr$sce, "UMAP")) %>% setNames(c("x", "y")) %>%
+    mutate(group = tr$sce$group, label = factor(tr$sce$label, levels = names(pal)),
+           pt = tr$sce$pt_avg, imbalance = tr$sce$imbalance)
+  add_curves <- function(p) {
+    if (is.null(tr$curves)) return(p)
+    p + geom_path(data = tr$curves, aes(x, y, group = lineage), inherit.aes = FALSE,
+                  linewidth = 0.9, colour = "black")
+  }
+  big <- guides(colour = guide_legend(override.aes = list(size = 3)))
+
+  p1 <- ggplot(df, aes(x, y, colour = group)) + geom_point(size = 0.3, alpha = 0.6) +
+    scale_colour_manual(values = grp_cols) + big + theme_umap + labs(title = group_var)
+  p2 <- add_curves(ggplot(df, aes(x, y, colour = label)) + geom_point(size = 0.3) +
+    scale_colour_manual(values = pal) + big + theme_umap +
+    labs(title = paste0("Fine labels (start: ", tr$start_label, ")"), colour = NULL))
+  p3 <- add_curves(ggplot(df, aes(x, y, colour = pt)) + geom_point(size = 0.3) +
+    scale_colour_viridis_c() + theme_umap + labs(title = "Pseudotime", colour = NULL))
+  p4 <- ggplot(df, aes(x, y, colour = imbalance)) + geom_point(size = 0.3) +
+    scale_colour_viridis_c(option = "magma") + theme_umap +
+    labs(title = "Imbalance score", colour = NULL)
+  (p1 | p2) / (p3 | p4)
+}
+
+plot_label_order <- function(tr) {
+  df <- tr$cell_df %>% mutate(label = factor(label, levels = tr$label_order))
+  ggplot(df, aes(pt, label, fill = group)) +
+    geom_boxplot(outlier.size = 0.2, width = 0.7, position = position_dodge(0.8)) +
+    scale_fill_manual(values = grp_cols) +
+    facet_wrap(~ lineage, scales = "free_x") +
+    theme_classic(base_size = 10) +
+    labs(x = "Pseudotime", y = NULL, fill = NULL,
+         title = "Fine labels along pseudotime (cells with lineage weight > 0.5)")
+}
+```
+
+```{r build-trajectories}
+traj <- list()
+for (nm in names(lineages)) {
+  traj[[nm]] <- safe(cached(file.path(path$cache_pseudotime, paste0(nm, "_trajectory.rds")),
+                            build_trajectory(nm, lineages[[nm]])),
+                     paste(nm, "trajectory"))
+}
+traj <- Filter(Negate(is.null), traj)
+
+for (nm in names(traj)) {
+  write.csv(traj[[nm]]$sanity, file.path(lin_dir(nm), "sanity_marker_correlation.csv"), row.names = FALSE)
+  writeLines(paste(names(traj[[nm]]$paths), traj[[nm]]$paths, sep = ": "),
+             file.path(lin_dir(nm), "lineages.txt"))
+}
+```
+
+```{r show-trajectories, results='asis', fig.height=9}
+for (i in seq_along(traj)) {
+  tr <- traj[[i]]
+  cat("\n\n### 7.5.", i, " ", tr$name, "\n\n", sep = "")
+  cat("Start label: **", tr$start_label, "**\n\n", sep = "")
+  for (l in tr$lin_names) cat("- ", l, ": ", tr$paths[[l]], "\n", sep = "")
+  cat("\n")
+  show_table(tr$sanity, caption = "Spearman correlation of pseudotime with start / end marker scores")
+  if (any(tr$sanity$rho_start > 0, na.rm = TRUE))
+    cat("**Warning:** pseudotime correlates positively with start markers – check the start label.\n\n")
+  print(plot_trajectory(tr))
+  cat("\n\n")
+  print(plot_label_order(tr))
+  cat("\n\n")
+}
+```
+
+## 7.6 Condition comparison: progression and fate
+
+```{r condition-tests-fn}
+condition_tests <- function(tr) {
+  cond <- tr$sce$group
+
+  topo <- if (run_topology)
+    safe(topologyTest(tr$sds, conditions = cond, rep = topology_reps), "topologyTest") else NULL
+  prog <- safe(progressionTest(tr$sds, conditions = cond, global = TRUE, lineages = TRUE),
+               "progressionTest")
+  fate <- if (length(tr$lin_names) > 1)
+    safe(fateSelectionTest(tr$sds, conditions = cond, global = TRUE, pairwise = TRUE),
+         "fateSelectionTest") else NULL
+
+  donor_df <- tr$cell_df %>%
+    group_by(lineage, donor, group) %>%
+    summarise(median_pt = median(pt), n_cells = n(), .groups = "drop") %>%
+    filter(n_cells >= min_cells_donor)
+  donor_prog <- donor_df %>% group_by(lineage) %>%
+    group_modify(~ donor_test(.x, "median_pt")) %>% ungroup()
+
+  fate_df <- donor_fate <- NULL
+  if (length(tr$lin_names) > 1) {
+    fate_df <- data.frame(donor = tr$sce$donor, group = tr$sce$group,
+                          lineage = tr$lin_names[max.col(tr$cw, ties.method = "first")]) %>%
+      count(donor, group, lineage) %>%
+      group_by(donor) %>% filter(sum(n) >= min_cells_donor) %>%
+      mutate(frac = n / sum(n)) %>% ungroup() %>%
+      complete(nesting(donor, group), lineage, fill = list(n = 0, frac = 0))
+    donor_fate <- fate_df %>% group_by(lineage) %>%
+      group_modify(~ donor_test(.x, "frac")) %>% ungroup()
+  }
+
+  list(topology = topo, progression = prog, fate = fate,
+       donor_df = donor_df, donor_progression = donor_prog,
+       donor_usage = fate_df, donor_fate = donor_fate)
+}
+
+plot_progression <- function(tr, ct) {
+  p1 <- ggplot(tr$cell_df, aes(pt, fill = group)) +
+    geom_density(alpha = 0.45, colour = NA) + scale_fill_manual(values = grp_cols) +
+    facet_wrap(~ lineage, scales = "free") + theme_classic(base_size = 10) +
+    labs(x = "Pseudotime", fill = NULL, title = "Cell density along pseudotime (cell level)")
+  p2 <- ggplot(tr$cell_df %>% filter(donor %in% ct$donor_df$donor),
+               aes(pt, group = donor, colour = group)) +
+    stat_ecdf(linewidth = 0.6, alpha = 0.8) + scale_colour_manual(values = grp_cols) +
+    facet_wrap(~ lineage, scales = "free_x") + theme_classic(base_size = 10) +
+    labs(x = "Pseudotime", y = "ECDF", colour = NULL, title = "Per-donor progression")
+  p3 <- ggplot(ct$donor_df, aes(group, median_pt, colour = group)) +
+    geom_boxplot(outlier.shape = NA, width = 0.5) +
+    geom_point(position = position_jitter(width = 0.12, seed = 1), size = 2) +
+    scale_colour_manual(values = grp_cols) + facet_wrap(~ lineage, scales = "free_y") +
+    theme_classic(base_size = 10) + theme(legend.position = "none") +
+    labs(x = NULL, y = "Median pseudotime per donor", title = "Donor-level progression")
+  p1 / p2 / p3
+}
+```
+
+```{r condition-tests}
+ctests <- list()
+for (nm in names(traj)) {
+  ctests[[nm]] <- safe(cached(file.path(path$cache_pseudotime, paste0(nm, "_condition_tests.rds")),
+                              condition_tests(traj[[nm]])),
+                       paste(nm, "condition tests"))
+  ct <- ctests[[nm]]
+  if (is.null(ct)) next
+  d <- lin_dir(nm)
+  if (!is.null(ct$topology))    write.csv(ct$topology,    file.path(d, "condiments_topology.csv"),    row.names = FALSE)
+  if (!is.null(ct$progression)) write.csv(ct$progression, file.path(d, "condiments_progression.csv"), row.names = FALSE)
+  if (!is.null(ct$fate))        write.csv(ct$fate,        file.path(d, "condiments_fate.csv"),        row.names = FALSE)
+  write.csv(ct$donor_df,          file.path(d, "donor_median_pseudotime.csv"), row.names = FALSE)
+  write.csv(ct$donor_progression, file.path(d, "donor_progression_test.csv"),  row.names = FALSE)
+  if (!is.null(ct$donor_fate)) {
+    write.csv(ct$donor_usage, file.path(d, "donor_lineage_usage.csv"),      row.names = FALSE)
+    write.csv(ct$donor_fate,  file.path(d, "donor_lineage_usage_test.csv"), row.names = FALSE)
+  }
+}
+```
+
+```{r show-condition-tests, results='asis', fig.height=11}
+for (i in seq_along(traj)) {
+  nm <- names(traj)[i]; tr <- traj[[nm]]; ct <- ctests[[nm]]
+  if (is.null(ct)) next
+  cat("\n\n### 7.6.", i, " ", nm, "\n\n", sep = "")
+  show_table(ct$topology, "Topology test (condiments) – significant = conditions may need separate trajectories")
+  show_table(ct$progression, "Progression test (condiments, cell level)")
+  show_table(ct$donor_progression, "Progression, donor level (median pseudotime per donor)")
+  if (!is.null(ct$fate)) {
+    show_table(ct$fate, "Fate selection test (condiments, cell level)")
+    show_table(ct$donor_fate, "Lineage usage, donor level")
+  }
+  print(plot_progression(tr, ct))
+  cat("\n\n")
+}
+```
+
+## 7.7 Gene dynamics along pseudotime (tradeSeq)
+
+```{r tradeseq-fn}
+fit_tradeseq <- function(tr) {
+  counts_mat <- counts(tr$sce)
+  cond       <- tr$sce$group
+  goi        <- intersect(tr$cfg$goi, rownames(counts_mat))
+  genes_use  <- unique(c(head(tr$hvg, n_gam_genes), goi))
+  genes_use  <- genes_use[Matrix::rowSums(counts_mat[genes_use, , drop = FALSE] > 0) >= 10]
+  bp <- MulticoreParam(workers = n_cores)
+
+  if (run_evaluateK) {
+    pdf(file.path(lin_dir(tr$name), "tradeSeq_evaluateK.pdf"), width = 12, height = 8)
+    safe(evaluateK(counts = counts_mat[genes_use, ], sds = tr$sds, conditions = cond,
+                   k = 3:8, nGenes = 200, verbose = FALSE), "evaluateK")
+    dev.off()
+  }
+
+  message(tr$name, ": fitting GAMs for ", length(genes_use), " genes")
+  gam <- fitGAM(counts = counts_mat, sds = tr$sds, conditions = cond,
+                genes = match(genes_use, rownames(counts_mat)),
+                nknots = nknots, parallel = TRUE, BPPARAM = bp, verbose = FALSE)
+
+  tidy_test <- function(res) res %>%
+    tibble::rownames_to_column("gene") %>%
+    filter(!is.na(pvalue)) %>%
+    mutate(padj = p.adjust(pvalue, "fdr")) %>%
+    arrange(desc(waldStat))
+
+  list(gam = gam,
+       cond_res  = tidy_test(conditionTest(gam, global = TRUE, lineages = TRUE)),
+       assoc_res = tidy_test(associationTest(gam, global = TRUE, lineages = TRUE)))
+}
+
+plot_smoothers <- function(tr, ts, n_top = 4) {
+  genes <- unique(c(intersect(tr$cfg$goi, rownames(ts$gam)),
+                    head(ts$cond_res$gene[ts$cond_res$padj < 0.05], n_top)))
+  if (length(genes) == 0) return(NULL)
+  counts_mat <- counts(tr$sce)
+  wrap_plots(lapply(genes, function(g)
+    plotSmoothers(ts$gam, counts_mat, gene = g, alpha = 0.3, sample = 0.5) +
+      ggtitle(g) +
+      theme(legend.position = "bottom", legend.text = element_text(size = 6))),
+    ncol = 3)
+}
+
+plot_heatmap <- function(ts, n = 30) {
+  top <- head(ts$cond_res$gene[ts$cond_res$padj < 0.05], n)
+  if (length(top) < 2) return(NULL)
+  ps <- predictSmooth(ts$gam, gene = top, nPoints = 50, tidy = TRUE)
+  if (!"condition" %in% names(ps)) ps$condition <- "all"
+  hm <- ps %>%
+    mutate(yhat = log1p(yhat)) %>%
+    group_by(gene) %>% mutate(z = as.numeric(scale(yhat))) %>%
+    group_by(gene, lineage, condition) %>% arrange(time, .by_group = TRUE) %>%
+    mutate(pos = row_number()) %>% ungroup()
+  gene_order <- hm %>% group_by(gene) %>%
+    summarise(peak = pos[which.max(z)], .groups = "drop") %>%
+    arrange(peak) %>% pull(gene)
+  ggplot(hm, aes(pos, factor(gene, levels = rev(gene_order)), fill = z)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B") +
+    facet_grid(. ~ lineage + condition, labeller = label_both) +
+    theme_minimal(base_size = 8) +
+    theme(axis.text.x = element_blank(), panel.grid = element_blank()) +
+    labs(x = "Pseudotime \u2192", y = NULL, fill = "z",
+         title = "Top condition-dependent genes (tradeSeq conditionTest, cell level)")
+}
+```
+
+```{r tradeseq}
+ts_res <- list()
+for (nm in names(traj)) {
+  ts_res[[nm]] <- safe(cached(file.path(path$cache_pseudotime, paste0(nm, "_tradeseq.rds")),
+                              fit_tradeseq(traj[[nm]])),
+                       paste(nm, "tradeSeq"))
+  if (is.null(ts_res[[nm]])) next
+  write.csv(ts_res[[nm]]$cond_res,  file.path(lin_dir(nm), "tradeSeq_conditionTest.csv"),   row.names = FALSE)
+  write.csv(ts_res[[nm]]$assoc_res, file.path(lin_dir(nm), "tradeSeq_associationTest.csv"), row.names = FALSE)
+}
+```
+
+```{r show-tradeseq, results='asis', fig.height=10}
+for (i in seq_along(ts_res)) {
+  nm <- names(ts_res)[i]; ts <- ts_res[[nm]]
+  if (is.null(ts)) next
+  cat("\n\n### 7.7.", i, " ", nm, "\n\n", sep = "")
+  cat("Genes with condition-dependent dynamics (FDR < 0.05): **",
+      sum(ts$cond_res$padj < 0.05), "** of ", nrow(ts$cond_res), " fitted\n\n", sep = "")
+  show_table(ts$cond_res %>% select(gene, waldStat, df, pvalue, padj),
+             "Top conditionTest genes", n = 15)
+  p <- plot_smoothers(traj[[nm]], ts)
+  if (!is.null(p)) { print(p); cat("\n\n") }
+  h <- plot_heatmap(ts)
+  if (!is.null(h)) { print(h); cat("\n\n") }
+}
+```
+
+## 7.8 Donor-aware pseudobulk along pseudotime
+
+```{r pseudobulk-fn}
+pseudobulk_bins <- function(tr) {
+  counts_mat <- counts(tr$sce)
+  out <- lapply(tr$lin_names, function(l) safe({
+    d <- tr$cell_df %>% filter(lineage == l)
+    brks  <- unique(quantile(d$pt, probs = seq(0, 1, length.out = n_bins + 1)))
+    d$bin <- cut(d$pt, brks, include.lowest = TRUE, labels = FALSE)
+    d$grp <- make.names(as.character(d$group))
+    d$sample <- paste(d$donor, d$bin, sep = "__")
+
+    pb   <- pseudobulk(counts_mat[, d$cell], d$sample)
+    meta <- d %>% group_by(sample, donor, grp, bin) %>%
+      summarise(n_cells = n(), .groups = "drop")
+    meta <- meta[match(colnames(pb), meta$sample), ]
+    keep <- meta$n_cells >= min_cells_pb
+    pb <- pb[, keep, drop = FALSE]; meta <- meta[keep, ]
+    meta$gb <- factor(paste0(meta$grp, "_b", meta$bin))
+
+    y_all  <- DGEList(pb)
+    logcpm <- cpm(y_all, log = TRUE, prior.count = 1)
+    y <- calcNormFactors(y_all[filterByExpr(y_all, group = meta$gb), , keep.lib.sizes = FALSE])
+
+    design <- model.matrix(~ 0 + gb, data = meta)
+    colnames(design) <- levels(meta$gb)
+    v   <- voom(y, design)
+    dc  <- duplicateCorrelation(v, design, block = meta$donor)
+    v   <- voom(y, design, block = meta$donor, correlation = dc$consensus.correlation)
+    dc  <- duplicateCorrelation(v, design, block = meta$donor)
+    fit <- lmFit(v, design, block = meta$donor, correlation = dc$consensus.correlation)
+
+    ref  <- make.names(ref_level)
+    cons <- character(0)
+    for (g in setdiff(unique(meta$grp), ref)) for (b in sort(unique(meta$bin))) {
+      a <- paste0(g, "_b", b); r <- paste0(ref, "_b", b)
+      if (sum(meta$gb == a) >= 2 && sum(meta$gb == r) >= 2)
+        cons[paste0(g, "_vs_", ref, "_bin", b)] <- paste0(a, " - ", r)
+    }
+    if (length(cons) == 0) stop("no bin with >= 2 donors per group")
+    cm <- makeContrasts(contrasts = unname(cons), levels = design)
+    colnames(cm) <- names(cons)
+    fit2 <- eBayes(contrasts.fit(fit, cm))
+
+    per_bin <- bind_rows(lapply(colnames(cm), function(k)
+      topTable(fit2, coef = k, number = Inf) %>%
+        tibble::rownames_to_column("gene") %>% mutate(contrast = k)))
+    any_bin <- topTable(fit2, number = Inf) %>% tibble::rownames_to_column("gene")
+
+    g_plot <- intersect(tr$cfg$goi, rownames(logcpm))
+    goi_df <- as.data.frame(t(logcpm[g_plot, , drop = FALSE])) %>%
+      tibble::rownames_to_column("sample") %>%
+      left_join(meta, by = "sample") %>%
+      pivot_longer(all_of(g_plot), names_to = "gene", values_to = "logCPM")
+
+    list(per_bin = per_bin, any_bin = any_bin, meta = meta, goi_df = goi_df,
+         consensus_cor = dc$consensus.correlation,
+         n_sig = per_bin %>% group_by(contrast) %>%
+           summarise(up = sum(adj.P.Val < 0.05 & logFC > 0),
+                     down = sum(adj.P.Val < 0.05 & logFC < 0), .groups = "drop"))
+  }, paste(tr$name, l, "pseudobulk")))
+  setNames(out, tr$lin_names)
+}
+
+plot_donor_genes <- function(pb, title) {
+  if (is.null(pb) || nrow(pb$goi_df) == 0) return(NULL)
+  ggplot(pb$goi_df, aes(bin, logCPM, colour = grp)) +
+    geom_line(aes(group = donor), alpha = 0.45) +
+    geom_point(size = 1, alpha = 0.6) +
+    stat_summary(aes(group = grp), fun = mean, geom = "line", linewidth = 1.2) +
+    scale_colour_manual(values = grp_cols_clean) +
+    facet_wrap(~ gene, scales = "free_y") + theme_classic(base_size = 10) +
+    labs(x = "Pseudotime bin", colour = NULL, title = title)
+}
+```
+
+```{r pseudobulk}
+pb_res <- list()
+for (nm in names(traj)) {
+  pb_res[[nm]] <- pseudobulk_bins(traj[[nm]])
+  for (l in names(pb_res[[nm]])) {
+    pb <- pb_res[[nm]][[l]]
+    if (is.null(pb)) next
+    write.csv(pb$per_bin, file.path(lin_dir(nm), paste0("pseudobulk_", l, "_per_bin.csv")), row.names = FALSE)
+    write.csv(pb$any_bin, file.path(lin_dir(nm), paste0("pseudobulk_", l, "_any_bin.csv")), row.names = FALSE)
+    write.csv(pb$meta,    file.path(lin_dir(nm), paste0("pseudobulk_", l, "_samples.csv")), row.names = FALSE)
+  }
+}
+```
+
+```{r show-pseudobulk, results='asis', fig.height=6}
+for (i in seq_along(pb_res)) {
+  nm <- names(pb_res)[i]
+  cat("\n\n### 7.8.", i, " ", nm, "\n\n", sep = "")
+  for (l in names(pb_res[[nm]])) {
+    pb <- pb_res[[nm]][[l]]
+    if (is.null(pb)) next
+    cat("**", l, "** (", traj[[nm]]$paths[[l]], ") – donor correlation across bins: ",
+        round(pb$consensus_cor, 2), "\n\n", sep = "")
+    show_table(pb$n_sig, "Genes differing per bin (limma, FDR < 0.05)")
+    show_table(pb$any_bin %>% select(gene, F, P.Value, adj.P.Val), "Top genes, any bin", n = 10)
+    p <- plot_donor_genes(pb, paste(nm, l, "– donor pseudobulk along pseudotime"))
+    if (!is.null(p)) { print(p); cat("\n\n") }
+  }
+}
+```
+
+## 7.9 Summary
+
+```{r summary}
+summary_prog <- bind_rows(lapply(names(ctests), function(nm) {
+  ct <- ctests[[nm]]
+  if (is.null(ct)) return(NULL)
+  bind_rows(
+    if (!is.null(ct$progression))
+      ct$progression %>% mutate(across(everything(), as.character), level = "cell (condiments)"),
+    ct$donor_progression %>% mutate(across(everything(), as.character), level = "donor")
+  ) %>% mutate(trajectory = nm)
+}))
+write.csv(summary_prog, file.path(path$results_pseudotime, "summary_progression.csv"), row.names = FALSE)
+
+summary_genes <- bind_rows(lapply(names(ts_res), function(nm) {
+  if (is.null(ts_res[[nm]])) return(NULL)
+  ts_res[[nm]]$cond_res %>% filter(padj < 0.05) %>%
+    select(gene, waldStat, pvalue, padj) %>% mutate(trajectory = nm)
+}))
+write.csv(summary_genes, file.path(path$results_pseudotime, "summary_tradeSeq_condition_genes.csv"), row.names = FALSE)
+
+summary_pb <- bind_rows(lapply(names(pb_res), function(nm)
+  bind_rows(lapply(names(pb_res[[nm]]), function(l)
+    if (!is.null(pb_res[[nm]][[l]]))
+      pb_res[[nm]][[l]]$n_sig %>% mutate(trajectory = nm, lineage = l)))))
+write.csv(summary_pb, file.path(path$results_pseudotime, "summary_pseudobulk_bins.csv"), row.names = FALSE)
+
+knitr::kable(summary_prog, caption = "Progression: cell vs donor level")
+knitr::kable(summary_genes %>% count(trajectory, name = "tradeSeq genes FDR < 0.05"))
+knitr::kable(summary_pb, caption = "Pseudobulk: genes per bin (FDR < 0.05)")
+```
+
+# Session info
+
+```{r session-info-07-pseudotime}
+sessionInfo()
+```

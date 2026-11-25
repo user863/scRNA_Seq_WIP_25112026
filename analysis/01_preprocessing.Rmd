@@ -1,0 +1,619 @@
+---
+title: "xALD single-cell atlas -- Part 1: Preprocessing"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r project-setup, include = FALSE}
+here::i_am("analysis/01_preprocessing.Rmd")
+source(here::here("R", "setup.R"), local = knitr::knit_global())
+```
+
+# Part 1: Preprocessing
+
+## 1.0 Cache check
+
+```{r preprocessing-cache-check}
+qc_method <- "osca_3mad"
+preprocessing_output <- file.path(path$objects, "03R_xALD_filtered_integrated.qs")
+preprocessing_force_recompute <- FALSE
+preprocessing_cached <- file.exists(preprocessing_output) && !preprocessing_force_recompute
+
+if (preprocessing_cached) {
+  message("Part 1: loading cached xALD_filtered from ", preprocessing_output,
+          " -- skipping recompute below.")
+  xALD_filtered <- qread(preprocessing_output)
+} else {
+  message("Part 1: no cache found (or recompute forced) -- running from raw input.")
+}
+```
+
+## 1.1 Load Data
+
+```{r, eval=!preprocessing_cached}
+raw_data_dir <- path$raw_data
+
+norm_dir <- function(x) sub("PBMCS$", "PBMC", toupper(gsub("-", "_", x)))
+raw_dirs <- list.files(raw_data_dir)
+raw_dirs <- raw_dirs[file.exists(file.path(raw_data_dir, raw_dirs, "raw_feature_bc_matrix.h5"))]
+ca_dirs  <- grep("^CA_", raw_dirs, value = TRUE)
+stopifnot(!anyDuplicated(norm_dir(ca_dirs)))
+
+col_data_xALD <- read_csv(path$sample_metadata) %>%
+  filter(diagnosis != "ALSP") %>%
+  filter(sex == "m") %>%
+  dplyr::mutate(
+    patient_ID = toupper(patient_ID),
+    sample_key = paste(patient_ID, type, sep = "_"),
+    ca_dir = ca_dirs[match(norm_dir(paste0("CA_", sample_key)), norm_dir(ca_dirs))],
+    dir_match = case_when(sample_ID %in% raw_dirs ~ "sample_ID", !is.na(ca_dir) ~ "CA_patient", TRUE ~ "none"),
+    dir = file.path(raw_data_dir, ifelse(sample_ID %in% raw_dirs, sample_ID, ca_dir))
+  ) %>%
+  dplyr::filter(!sample_key %in% readr::read_csv(path$excluded_samples, show_col_types = FALSE)$sample_key)
+```
+
+```{r, eval=!preprocessing_cached}
+col_data_xALD %>% dplyr::count(type, diagnosis)
+col_data_xALD %>% dplyr::count(dir_match)
+col_data_xALD %>% dplyr::select(sample_key, sample_ID, dir_match, dir) %>% print(n = Inf)
+h5_missing <- col_data_xALD$sample_key[!file.exists(file.path(col_data_xALD$dir, "raw_feature_bc_matrix.h5"))]
+if (length(h5_missing)) stop("no raw folder for: ", paste(h5_missing, collapse = ", "))
+setdiff(raw_dirs, basename(col_data_xALD$dir))
+```
+
+## 1.2 SoupX
+
+### 1.2.1 preliminary clustering
+
+### 1.2.2 preparation for soupX
+
+```{r, eval=!preprocessing_cached}
+options(future.globals.maxSize = 5000 * 1024^2)
+emptydrops_fdr <- 0.001
+soupx_output <- file.path(path$objects, paste0("01R_xALD_soupx_merged_fdr", emptydrops_fdr, ".qs"))
+soupx_cached <- file.exists(soupx_output)
+if (soupx_cached) seu_corrected <- qread(soupx_output)
+```
+
+### 1.2.3 loop through samples
+
+```{r, eval=!preprocessing_cached && !soupx_cached}
+seu_list <- list()
+
+for (i in seq_len(nrow(col_data_xALD))) {
+
+  s <- col_data_xALD$sample_key[i]
+  message("Processing sample: ", s)
+
+  raw <- Read10X_h5(file.path(col_data_xALD$dir[i], "raw_feature_bc_matrix.h5"))
+  if (is.list(raw)) raw <- raw[["Gene Expression"]]
+
+  set.seed(42)
+  e.out <- emptyDrops(raw)
+  filtered <- raw[, which(e.out$FDR <= emptydrops_fdr)]
+  message("  Cells recovered by emptyDrops: ", ncol(filtered))
+
+  prelim <- CreateSeuratObject(filtered) %>%
+    NormalizeData(verbose = FALSE) %>%
+    FindVariableFeatures(verbose = FALSE) %>%
+    ScaleData(verbose = FALSE) %>%
+    RunPCA(verbose = FALSE) %>%
+    FindNeighbors(dims = 1:20, verbose = FALSE) %>%
+    FindClusters(resolution = 0.4, verbose = FALSE)
+
+  sc <- SoupChannel(raw, filtered)
+  sc <- setClusters(sc, setNames(prelim$seurat_clusters, colnames(prelim)))
+  sc <- tryCatch(
+    autoEstCont(sc, verbose = FALSE),
+    error = function(e) {
+      message("  autoEstCont failed for ", s, ": ", e$message, " — setting rho=0.05")
+      setContaminationFraction(sc, 0.05)
+    }
+  )
+  out <- adjustCounts(sc)
+
+  colnames(out) <- colnames(filtered) <- paste(s, colnames(filtered), sep = "_")
+  obj <- CreateSeuratObject(out, project = s)
+  Key(obj[["RNA"]]) <- "rna_"
+  obj[["RNA_raw"]] <- CreateAssay5Object(counts = filtered)
+  meta <- col_data_xALD[rep(i, ncol(obj)), setdiff(colnames(col_data_xALD), "dir")]
+  obj@meta.data <- cbind(obj@meta.data, as.data.frame(meta, row.names = colnames(obj)))
+  seu_list[[s]] <- obj
+
+  rm(raw, filtered, prelim, sc, out); invisible(gc())
+}
+```
+
+### 1.2.4 Remerge corrected matrices in a new SeuratObject
+
+```{r, eval=!preprocessing_cached && !soupx_cached}
+seu_corrected <- merge(seu_list[[1]], y = seu_list[-1])
+seu_corrected[["RNA"]] <- JoinLayers(seu_corrected[["RNA"]])
+seu_corrected[["RNA_raw"]] <- JoinLayers(seu_corrected[["RNA_raw"]])
+rm(seu_list); invisible(gc())
+
+seu_corrected[["percent.mt"]] <- PercentageFeatureSet(seu_corrected, pattern = "^MT-")
+seu_corrected$log10GenesPerUMI <- log10(seu_corrected$nFeature_RNA) / log10(seu_corrected$nCount_RNA)
+table(seu_corrected$type)
+qsave(seu_corrected, soupx_output)
+```
+
+#### 1.2.4.1 Quality Control [EXPLORATORY / QC]
+
+```{r, eval=!preprocessing_cached}
+diagnosis_check <- seu_corrected@meta.data %>%
+  dplyr::group_by(patient_ID) %>%
+  dplyr::summarise(
+    diagnoses    = paste(unique(diagnosis), collapse = "/"),
+    n_diagnoses  = dplyr::n_distinct(diagnosis),
+    n_cells      = dplyr::n(),
+    .groups = "drop"
+  )
+
+print(diagnosis_check)
+
+mixed <- diagnosis_check %>% dplyr::filter(n_diagnoses > 1)
+if (nrow(mixed) == 0) {
+  message("pass: All patients have a single diagnosis label")
+} else {
+  message("x ", nrow(mixed), " patient(s) have mixed diagnosis labels:")
+  print(mixed)
+}
+
+seu_corrected@meta.data %>%
+  dplyr::distinct(patient_ID, diagnosis) %>%
+  dplyr::count(diagnosis)
+
+seu_corrected@meta.data %>%
+  dplyr::summarise(across(any_of(c("patient_ID", "diagnosis", "type", "sample_key", "sex", "age")),
+                          ~ sum(is.na(.))))
+
+seu_corrected@meta.data %>%
+  dplyr::count(patient_ID, diagnosis, type) %>%
+  dplyr::arrange(type, diagnosis, patient_ID) %>%
+  tibble::as_tibble() %>%
+  print(n = Inf)
+```
+
+## 1.3 Cell Level filtering
+
+### 1.3.1 basic Quality Control [EXPLORATORY / QC]
+
+```{r, eval=!preprocessing_cached}
+seu_corrected@meta.data %>%
+  ggplot(aes(color=patient_ID, x=nCount_RNA, fill= patient_ID)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  facet_wrap(~type)
+
+seu_corrected@meta.data %>%
+  ggplot(aes(color=patient_ID, x=percent.mt, fill=patient_ID)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  facet_wrap(~type)
+```
+
+### 1.3.2 Novelty Score & Joint effects [EXPLORATORY / QC]
+
+```{r, eval=!preprocessing_cached}
+metadata <- seu_corrected@meta.data
+
+metadata %>%
+  ggplot(aes(x= patient_ID, fill= patient_ID)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  facet_wrap(~type)
+
+metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = patient_ID, fill=patient_ID)) +
+  geom_density(alpha = 0.2) +
+  theme_classic()
+```
+
+#### 1.3.2.1 Cell-level Filtering [CORE]
+
+```{r, eval=!preprocessing_cached}
+mad_out <- function(x, n, type) scuttle::isOutlier(x, nmads = n, type = type, batch = seu_corrected$sample_key)
+
+top20 <- scuttle::perCellQCMetrics(LayerData(seu_corrected, assay = "RNA", layer = "counts"),
+                                   percent.top = 20)$percent.top_20
+
+qc_keep <- tibble(
+  cell      = colnames(seu_corrected),
+  osca_3mad = !(mad_out(log10(seu_corrected$nCount_RNA + 1), 3, "lower") |
+                mad_out(log10(seu_corrected$nFeature_RNA + 1), 3, "lower") |
+                mad_out(seu_corrected$percent.mt, 3, "higher")),
+  scbp_5mad = !(mad_out(log1p(seu_corrected$nCount_RNA), 5, "both") |
+                mad_out(log1p(seu_corrected$nFeature_RNA), 5, "both") |
+                mad_out(top20, 5, "both") |
+                mad_out(seu_corrected$percent.mt, 3, "higher") | seu_corrected$percent.mt > 8),
+  fixed     = seu_corrected$nCount_RNA >= 500 & seu_corrected$nFeature_RNA > 300 & seu_corrected$percent.mt < 10)
+
+qc_keep %>%
+  mutate(sample_key = seu_corrected$sample_key) %>%
+  group_by(sample_key) %>%
+  summarise(n = n(), across(c(osca_3mad, scbp_5mad, fixed), sum))
+
+attr(mad_out(seu_corrected$percent.mt, 3, "higher"), "thresholds")
+
+seu_corrected$qc_keep <- qc_keep[[qc_method]]
+
+seu_corrected@meta.data %>%
+  ggplot(aes(x = nCount_RNA, y = nFeature_RNA, color = qc_keep)) +
+  geom_point(size = 0.1) +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_classic() +
+  facet_wrap(~ type)
+
+filtered_seurat <- subset(seu_corrected, subset = qc_keep)
+ncol(seu_corrected)
+ncol(filtered_seurat)
+```
+
+#### 1.3.2.2 filtering for duplets [CORE]
+
+```{r, eval=!preprocessing_cached}
+xALD <- filtered_seurat %>% SplitObject(split.by = "type")
+rm(filtered_seurat); invisible(gc())
+
+tcr_genes     <- c("CD3D", "CD3E", "CD3G", "TRAC", "TRBC2", "CD2", "IL7R", "CD247", "LCK", "IL32")
+myeloid_genes <- c("CD14", "CST3", "CD68", "FCN1", "AIF1", "CSF1R", "MNDA", "C1QA")
+
+xALD <- lapply(xALD, function(obj) {
+  sce <- as.SingleCellExperiment(obj, assay = "RNA")
+  sce <- scDblFinder(sce, samples = sce$sample_key)
+  obj$scDblFinder.class <- sce$scDblFinder.class
+  obj$scDblFinder.score <- sce$scDblFinder.score
+  cnt <- LayerData(obj, assay = "RNA", layer = "counts")
+  obj$tcr_myeloid <- Matrix::colSums(cnt[intersect(tcr_genes, rownames(cnt)), ] > 0) >= 3 &
+                     Matrix::colSums(cnt[intersect(myeloid_genes, rownames(cnt)), ] > 0) >= 3
+  obj[["percent.hb"]] <- PercentageFeatureSet(obj, features = intersect(c("HBA1", "HBA2", "HBB"), rownames(obj)))
+  obj
+})
+
+lapply(xALD, function(obj) obj@meta.data %>%
+  group_by(sample_key, diagnosis) %>%
+  summarise(n = n(), doublet = sum(scDblFinder.class == "doublet"),
+            tcr_myeloid = sum(tcr_myeloid & scDblFinder.class == "singlet"),
+            hb = sum(percent.hb > 1), .groups = "drop"))
+```
+
+#### 1.3.2.3 Filter for erhythoctes [CORE]
+
+```{r, eval=!preprocessing_cached}
+xALD <- lapply(xALD, function(obj)
+  subset(obj, subset = scDblFinder.class == "singlet" & !tcr_myeloid & percent.hb <= 1))
+
+lapply(xALD, ncol)
+```
+
+## 1.4 Normalization & Integration [CORE]
+
+```{r, eval=!preprocessing_cached}
+options(future.globals.maxSize = 5000 * 1024^2)
+set.seed(42)
+
+xALD <- lapply(xALD, function(so) {
+  so %>%
+    NormalizeData() %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>%
+    RunPCA() %>%
+    RunHarmony("patient_ID") %>%
+    RunUMAP(reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony") %>%
+    FindNeighbors(reduction = "harmony") %>%
+    FindClusters(algorithm = 4, resolution = 2.5)
+})
+```
+
+#### 1.4.2.1 DimPlot [EXPLORATORY / QC]
+
+```{r, eval=!preprocessing_cached}
+xALD %>% lapply(DimPlot_scCustom, reduction = 'umap_harmony')
+```
+
+## 1.5 Cluster [CORE]
+
+```{r, eval=!preprocessing_cached}
+qsave(xALD, file.path(path$objects, "02R_xALD_unfiltered_integrated.qs"))
+```
+
+### 1.5.1 DimPlots and Cluster QC [EXPLORATORY / QC]
+
+```{r, eval=!preprocessing_cached}
+clusterplots <- xALD %>%
+  lapply(function(so){
+  so@meta.data %>%
+    bind_cols(so@reductions$umap_harmony@cell.embeddings %>% as.data.frame) %>%
+    ggplot(aes(x = umapharmony_1,y = umapharmony_2)) +
+      geom_point(aes(color = seurat_clusters), size = 0.1) +
+      geom_label(data = . %>%
+                   group_by(seurat_clusters) %>%
+                   summarise(x = mean(umapharmony_1),y = mean(umapharmony_2)),
+                 aes(x = x,y = y, label = seurat_clusters))
+})
+
+iwalk(clusterplots, function(p, name) {
+  print(p)
+  ggsave(
+    filename = file.path(path$graphs, paste0("umap_Cluster_allCells", name, ".png")),
+    plot     = p,
+    width    = 8,
+    height   = 7,
+    dpi      = 300
+  )
+})
+
+xALD$CSF %>% DimPlot_scCustom(group.by = 'diagnosis',reduction = 'umap_harmony')
+xALD$PBMC %>% DimPlot_scCustom(group.by = 'diagnosis',reduction = 'umap_harmony')
+
+xALD %>% lapply(function(so){
+  so %>% FeaturePlot_scCustom(c('nCount_RNA','nFeature_RNA','percent.mt'),
+                       reduction = 'umap_harmony') &
+    scale_color_viridis_c(trans = 'log10')})
+```
+
+```{r, eval=!preprocessing_cached}
+cluster_qc <- imap_dfr(xALD, function(so, ti) {
+  med <- median(so$nCount_RNA)
+  so@meta.data %>% group_by(seurat_clusters) %>%
+    summarise(n = n(), donors = n_distinct(patient_ID), max_donor_share = max(table(patient_ID)) / n(),
+              count_ratio = median(nCount_RNA) / med, nFeature = median(nFeature_RNA),
+              mt = median(percent.mt), dbl_score = median(scDblFinder.score), .groups = "drop") %>%
+    mutate(tissue = ti, .before = 1, seurat_clusters = as.character(seurat_clusters))
+})
+cluster_qc %>% mutate(across(where(is.double), ~ round(.x, 2))) %>% print(n = Inf, width = Inf)
+```
+
+### 1.5.2 Marker genes [CORE]
+
+```{r, eval=!preprocessing_cached}
+marker_list_2 <- lapply(xALD, function(so) {
+  Idents(so) <- so$seurat_clusters
+  FindAllMarkers(
+    so,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+})
+
+top10_markers_byseuratClus <- lapply(marker_list_2, function(df) {
+  df %>%
+    group_by(cluster) %>%
+    slice_max(avg_log2FC, n = 20)
+})
+
+top10_markers_byseuratClus[[1]]
+top10_markers_byseuratClus[[2]]
+```
+
+#### 1.5.2.1 dot Plot marker genes [EXPLORATORY / QC]
+
+```{r, eval=!preprocessing_cached, fig.width = 10, fig.height = 12}
+markers_all <- c("MKI67", "TOP2A", "MZB1", "IGKC", "IGHM", "MS4A1", "CD79B", "CD79A",
+                 "NCR1", "SH2D1B", "KLRF1", "KLRC1", "TRDC", "CD8B", "CD8A", "CD40LG", "LEF1", "MAL",
+                 "CLEC4C", "PTCRA", "LILRA4", "SCT", "LRRC26", "CST3", "CSF1R", "MNDA", "LYZ",
+                 "CD34", "PPBP", "PF4", "HBB")
+iwalk(xALD, function(so, ti)
+  print(plot_marker_dotplot(so, intersect(markers_all, rownames(so)), "seurat_clusters", title = ti)))
+```
+
+#### 1.5.2.2 Labelling seurat Clusters [CORE]
+
+```{r cluster-labels, eval=!preprocessing_cached}
+raw_cluster_labels <- list(
+  CSF = c(
+  ),
+  PBMC = c(
+  )
+)
+
+raw_removed <- tibble::tribble(
+  ~tissue, ~seurat_clusters, ~reason
+)
+```
+
+### 1.5.3 Filter and rename Seurat Object [CORE]
+
+```{r, eval=!preprocessing_cached}
+for (ti in names(xALD)) {
+  have <- levels(droplevels(xALD[[ti]]$seurat_clusters))
+  done <- c(names(raw_cluster_labels[[ti]]), raw_removed$seurat_clusters[raw_removed$tissue == ti])
+  if (length(setdiff(have, done)))
+    stop(ti, ": clusters without a label or removal row: ", paste(setdiff(have, done), collapse = ", "))
+  if (length(setdiff(done, have)))
+    stop(ti, ": labelled clusters that do not exist: ", paste(setdiff(done, have), collapse = ", "))
+  if (anyDuplicated(done)) stop(ti, ": cluster both labelled and removed, or listed twice")
+  bad <- names(raw_cluster_labels[[ti]])[raw_cluster_labels[[ti]] %in% c("NA", "", "TODO") | is.na(raw_cluster_labels[[ti]])]
+  if (length(bad)) stop(ti, ": clusters without a real label: ", paste(bad, collapse = ", "))
+}
+
+raw_removed %>%
+  left_join(cluster_qc, by = c("tissue", "seurat_clusters")) %>%
+  mutate(across(where(is.double), ~ round(.x, 3))) %>%
+  write_csv(file.path(path$tables, "allcells_cluster_review.csv"))
+
+xALD_filtered <- imap(xALD, function(so, ti) {
+  so$celltypes <- unname(raw_cluster_labels[[ti]][as.character(so$seurat_clusters)])
+  subset(so, cells = colnames(so)[!is.na(so$celltypes)])
+})
+```
+
+#### 1.5.3.1 ReRun UMAP/Harmony [CORE]
+
+```{r, eval=!preprocessing_cached}
+xALD_filtered <- lapply(xALD_filtered, function(so) {
+  so@reductions <- so@reductions[!grepl("umap", names(so@reductions), ignore.case = TRUE)]
+  so %>%
+    NormalizeData() %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>%
+    RunPCA() %>%
+    RunHarmony("patient_ID") %>%
+    RunUMAP(reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony")
+})
+lapply(xALD_filtered, function(so) table(so$celltypes))
+
+qsave(xALD_filtered, preprocessing_output)
+```
+
+#### 1.5.3.2 Quality Control [EXPLORATORY / QC]
+
+```{r}
+xALD_filtered %>% lapply(function(so){
+  so %>% FeaturePlot_scCustom(c('nCount_RNA','nFeature_RNA','percent.mt'),
+                       reduction = 'umap_harmony') &
+    scale_color_viridis_c(trans = 'log10')})
+
+xALD_filtered %>%
+  lapply(function(so){
+
+    df <- so@meta.data %>%
+      bind_cols(so@reductions$umap_harmony@cell.embeddings %>% as.data.frame) %>%
+      arrange(!is.na(celltypes))
+
+    ggplot(df, aes(x = umapharmony_1, y = umapharmony_2)) +
+      geom_point(aes(color = celltypes), size = 0.1) +
+      geom_label(
+        data = df %>%
+          group_by(celltypes) %>%
+          summarise(
+            x = mean(umapharmony_1),
+            y = mean(umapharmony_2),
+            .groups = "drop"
+          ),
+        aes(x = x, y = y, label = celltypes)
+      ) +
+      facet_wrap(~ diagnosis) +
+      theme_classic()
+})
+```
+
+```{r}
+
+all_celltypes <- xALD_filtered %>%
+  lapply(function(so) as.character(so$celltypes)) %>%
+  unlist() %>%
+  unique() %>%
+  na.omit() %>%
+  sort()
+
+celltype_colors <- make_celltype_palette(all_celltypes)
+
+plots <- xALD_filtered %>%
+  lapply(function(so){
+    df <- so@meta.data %>%
+      bind_cols(as.data.frame(so@reductions$umap_harmony@cell.embeddings)) %>%
+      dplyr::mutate(celltypes = factor(as.character(celltypes),
+                                       levels = all_celltypes))
+    ggplot(df, aes(x = umapharmony_1, y = umapharmony_2)) +
+      geom_point(aes(color = celltypes,
+                     alpha = is.na(celltypes)),
+                 size = 0.1) +
+      geom_label(
+        data = df %>%
+          dplyr::group_by(celltypes) %>%
+          dplyr::summarise(
+            x = mean(umapharmony_1, na.rm = TRUE),
+            y = mean(umapharmony_2, na.rm = TRUE),
+            .groups = "drop"
+          ),
+        aes(x = x, y = y, label = celltypes)
+      ) +
+      scale_alpha_manual(
+        values = setNames(c(0.1, 1), c(TRUE, FALSE)),
+        guide  = "none"
+      ) +
+      scale_color_manual(
+        values   = celltype_colors,
+        na.value = "grey80",
+        drop     = TRUE
+      ) +
+      labs(x = "UMAP1", y = "UMAP2", color = "Cell type") +
+      theme_classic() +
+      theme(
+        axis.text        = element_blank(),
+        axis.ticks       = element_blank(),
+        axis.line        = element_line(color = "black", linewidth = 0.5),
+        legend.position  = "right",
+        legend.text      = element_text(size = 8),
+        legend.title     = element_text(size = 9, face = "bold"),
+        plot.title       = element_text(size = 11, face = "bold", hjust = 0.5),
+        panel.background = element_rect(fill = "white"),
+        plot.background  = element_rect(fill = "white", color = NA)
+      )
+  })
+
+plots %>% lapply(print)
+
+names(plots) <- c("CSF", "PBMC")
+
+iwalk(plots, function(p, name) {
+  ggsave(
+    filename = file.path(path$graphs, paste0("umap_allCells_", name, ".png")),
+    plot     = p,
+    width    = 8,
+    height   = 7,
+    dpi      = 300
+  )
+})
+
+```
+
+#### 1.5.3.3 dotplot [CORE]
+
+```{r}
+celltypemarkers_CSF <-  c("CD34",
+  "MKI67", "TOP2A",
+  "IGKC", "IGHM", "MS4A1", "CD79B", "CD79A",
+  "NCR1", "SH2D1B", "KLRF1", "KLRC1",
+  "TRDC",
+  "CD8B", "CD8A",
+  "CD40LG", "LEF1", "MAL",
+  "CLEC4C", "PTCRA", "LILRA4", "SCT", "LRRC26",
+  "CST3", "CSF1R", "MNDA", "LYZ"
+)
+
+celltypemarkers_PBMC <-  c("CD34",
+  "MKI67", "TOP2A", "MZB1",
+  "IGKC", "IGHM", "MS4A1", "CD79B", "CD79A",
+  "NCR1", "SH2D1B", "KLRF1", "KLRC1",
+  "TRDC",
+  "CD8B", "CD8A",
+  "CD40LG", "LEF1", "MAL",
+  "CLEC4C", "PTCRA", "LILRA4", "SCT", "LRRC26",
+  "CST3", "CSF1R", "MNDA", "LYZ"
+)
+
+celltype_order <- c("Myeloid Cells", "pDC", "CD4+T-Cells", "CD8+T-Cells", "NK Cells", "B-Cells")
+celltype_order_PBMC <- c("Myeloid Cells", "pDC", "CD4+T-Cells", "CD8+T-Cells", "NK Cells", "B-Cells","Plasmablasts", "Proliferating Cells", "HSPCs")
+order_present <- function(ord, so) { have <- unique(as.character(so$celltypes)); c(intersect(ord, have), sort(setdiff(have, ord))) }
+
+plot_marker_dotplot(xALD_filtered[["CSF"]], celltypemarkers_CSF, "celltypes",
+                    title = "CSF", order = order_present(celltype_order, xALD_filtered[["CSF"]]))
+ggsave(file.path(path$graphs, "dotplot_allCells_Cluster_markergenes_CSF.png"), width = 5, height = 12, dpi = 300)
+
+plot_marker_dotplot(xALD_filtered[["PBMC"]], celltypemarkers_PBMC, "celltypes",
+                    title = "PBMC", order = order_present(celltype_order_PBMC, xALD_filtered[["PBMC"]]))
+ggsave(file.path(path$graphs, "dotplot_allCells_Cluster_markergenes_PBMC.png"), width = 5, height = 12, dpi = 300)
+```
+
+# Session info
+
+```{r session-info-01-preprocessing}
+sessionInfo()
+```

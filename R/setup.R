@@ -1,0 +1,11 @@
+
+source(here::here("R", "00_packages.R"), local = knitr::knit_global())
+source(here::here("R", "01_paths.R"), local = knitr::knit_global())
+source(here::here("R", "02_colours_plotting.R"), local = knitr::knit_global())
+source(here::here("R", "03_deg.R"), local = knitr::knit_global())
+source(here::here("R", "04_abundance.R"), local = knitr::knit_global())
+source(here::here("R", "05_umap_dotplots.R"), local = knitr::knit_global())
+source(here::here("R", "06_genesets_tf.R"), local = knitr::knit_global())
+source(here::here("R", "07_severity_loo.R"), local = knitr::knit_global())
+source(here::here("R", "08_cluster_plots.R"), local = knitr::knit_global())
+source(here::here("R", "09_lineage.R"), local = knitr::knit_global())
